@@ -92,6 +92,668 @@ function text_length(string $value): int
 }
 
 /**
+ * 生成纯文本摘要
+ */
+function text_excerpt(string $text, int $limit = 90): string
+{
+    $text = (string) preg_replace('/\[activity:\d+\]/u', '', $text);
+    $text = html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $text = str_replace("\xC2\xA0", ' ', $text);
+    $text = trim((string) preg_replace('/\s+/u', ' ', $text));
+    if ($text === '') {
+        return '';
+    }
+
+    if (text_length($text) <= $limit) {
+        return $text;
+    }
+
+    if (function_exists('mb_substr')) {
+        return mb_substr($text, 0, $limit, 'UTF-8') . '…';
+    }
+
+    return substr($text, 0, $limit) . '…';
+}
+
+function sanitize_editor_style(string $style): string
+{
+    $alignments = ['left', 'center', 'right', 'justify'];
+    $output     = [];
+
+    foreach (explode(';', $style) as $declaration) {
+        $parts = explode(':', $declaration, 2);
+        if (count($parts) !== 2) {
+            continue;
+        }
+
+        $property = strtolower(trim($parts[0]));
+        $value    = strtolower(trim($parts[1]));
+
+        if ($property === 'text-align' && in_array($value, $alignments, true)) {
+            $output[] = $property . ': ' . $value;
+            continue;
+        }
+
+        if (($property === 'color' || $property === 'background-color')
+            && preg_match('/^(#[0-9a-f]{3,8}|rgba?\([\d\s.,%]+\))$/', $value)) {
+            $output[] = $property . ': ' . $value;
+        }
+    }
+
+    return implode('; ', $output);
+}
+
+function sanitize_article_html(string $html): string
+{
+    $html = trim($html);
+    if ($html === '') {
+        return '';
+    }
+
+    $html = (string) preg_replace(
+        '#<(script|style|iframe|object|embed|form|input|button|textarea|select|option|link|meta)\b[^>]*>.*?</\1>#is',
+        '',
+        $html
+    );
+    $html = (string) preg_replace(
+        '#<(script|style|iframe|object|embed|form|input|button|textarea|select|option|link|meta)\b[^>]*/?>#i',
+        '',
+        $html
+    );
+
+    $dom = new DOMDocument('1.0', 'UTF-8');
+    libxml_use_internal_errors(true);
+    $dom->loadHTML(
+        '<?xml encoding="UTF-8"><body><div data-article-root="1">' . $html . '</div></body>',
+        LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
+    );
+    libxml_clear_errors();
+
+    $xpath    = new DOMXPath($dom);
+    $nodeList = $xpath->query('//div[@data-article-root="1"]');
+    $root     = $nodeList === false ? null : $nodeList->item(0);
+    if (!$root instanceof DOMElement) {
+        return '';
+    }
+
+    $allowed = [
+        'p'          => [],
+        'br'         => [],
+        'strong'     => [],
+        'b'          => [],
+        'em'         => [],
+        'i'          => [],
+        'u'          => [],
+        's'          => [],
+        'h1'         => [],
+        'h2'         => [],
+        'h3'         => [],
+        'h4'         => [],
+        'ul'         => [],
+        'ol'         => [],
+        'li'         => [],
+        'blockquote' => [],
+        'hr'         => [],
+        'div'        => [],
+        'span'       => [],
+        'a'          => ['href', 'title', 'target', 'rel'],
+        'img'        => ['src', 'alt', 'title'],
+    ];
+
+    $walk = function (DOMNode $node) use (&$walk, $allowed): void {
+        $children = [];
+        foreach ($node->childNodes as $child) {
+            $children[] = $child;
+        }
+
+        foreach ($children as $child) {
+            if (!$child instanceof DOMElement) {
+                continue;
+            }
+
+            $tag = strtolower($child->tagName);
+
+            if (!isset($allowed[$tag])) {
+                $walk($child);
+                while ($child->firstChild) {
+                    $node->insertBefore($child->firstChild, $child);
+                }
+                $node->removeChild($child);
+                continue;
+            }
+
+            $attributes = [];
+            foreach ($child->attributes as $attribute) {
+                $attributes[] = $attribute->nodeName;
+            }
+
+            foreach ($attributes as $attributeName) {
+                $name = strtolower($attributeName);
+
+                if ($name === 'style') {
+                    $cleanStyle = sanitize_editor_style((string) $child->getAttribute('style'));
+                    if ($cleanStyle === '') {
+                        $child->removeAttribute($attributeName);
+                    } else {
+                        $child->setAttribute($attributeName, $cleanStyle);
+                    }
+                    continue;
+                }
+
+                if (!in_array($name, $allowed[$tag], true)) {
+                    $child->removeAttribute($attributeName);
+                    continue;
+                }
+
+                if ($name === 'href') {
+                    $url = trim((string) $child->getAttribute('href'));
+                    if (!preg_match('#^(https?://|mailto:|tel:|/|\#)#i', $url)) {
+                        $child->removeAttribute('href');
+                    }
+                }
+
+                if ($name === 'src') {
+                    $url = trim((string) $child->getAttribute('src'));
+                    if (!preg_match('#^(https?://|/)#i', $url)) {
+                        $child->removeAttribute('src');
+                    }
+                }
+            }
+
+            if ($tag === 'a' && $child->getAttribute('target') === '_blank') {
+                $child->setAttribute('rel', 'noopener');
+            }
+
+            if ($tag === 'img' && trim((string) $child->getAttribute('src')) === '') {
+                $node->removeChild($child);
+                continue;
+            }
+
+            $walk($child);
+        }
+    };
+
+    $walk($root);
+
+    $output = '';
+    foreach ($root->childNodes as $child) {
+        $output .= $dom->saveHTML($child);
+    }
+
+    return trim($output);
+}
+
+function article_content_to_editor_html(string $content, string $format): string
+{
+    if ($format === 'html') {
+        return sanitize_article_html($content);
+    }
+
+    $lines = preg_split('/\r\n|\r|\n/', $content);
+    if (!is_array($lines)) {
+        return '<p>' . h($content) . '</p>';
+    }
+
+    $html = '';
+    foreach ($lines as $line) {
+        $line = rtrim((string) $line);
+        $html .= $line === '' ? '<p><br></p>' : '<p>' . h($line) . '</p>';
+    }
+
+    return $html;
+}
+
+function article_content_is_empty(string $html): bool
+{
+    if (preg_match('/\[activity:\d+\]/u', $html)) {
+        return false;
+    }
+    if (preg_match('/<(img|hr)\b/i', $html)) {
+        return false;
+    }
+
+    $text = html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $text = str_replace("\xC2\xA0", ' ', $text);
+
+    return trim($text) === '';
+}
+
+function get_activity(PDO $db, int $id): ?array
+{
+    $stmt = $db->prepare('SELECT * FROM `activities` WHERE `id` = ? LIMIT 1');
+    $stmt->execute([$id]);
+    $activity = $stmt->fetch();
+
+    return $activity === false ? null : $activity;
+}
+
+function activity_entry_count(PDO $db, int $activityId): int
+{
+    $stmt = $db->prepare('SELECT COUNT(*) FROM `activity_submissions` WHERE `activity_id` = ?');
+    $stmt->execute([$activityId]);
+
+    return (int) $stmt->fetchColumn();
+}
+
+function activity_status(array $activity, int $entryCount): array
+{
+    if ((int) $activity['is_open'] !== 1) {
+        return ['open' => false, 'label' => '报名已关闭', 'message' => '该活动报名已关闭。'];
+    }
+    if (!empty($activity['deadline']) && strtotime((string) $activity['deadline']) < time()) {
+        return ['open' => false, 'label' => '报名已截止', 'message' => '该活动报名已截止。'];
+    }
+    if ((int) $activity['max_entries'] > 0 && $entryCount >= (int) $activity['max_entries']) {
+        return ['open' => false, 'label' => '名额已满', 'message' => '该活动报名名额已满。'];
+    }
+
+    return ['open' => true, 'label' => '报名中', 'message' => ''];
+}
+
+function format_file_size(int $bytes): string
+{
+    if ($bytes >= 1048576) {
+        return number_format($bytes / 1048576, 1) . ' MB';
+    }
+    if ($bytes >= 1024) {
+        return number_format($bytes / 1024, 1) . ' KB';
+    }
+
+    return $bytes . ' B';
+}
+
+function render_activity_form(array $activity, int $returnArticleId = 0): string
+{
+    $activityId = (int) $activity['id'];
+    $entryCount = activity_entry_count(db(), $activityId);
+    $status     = activity_status($activity, $entryCount);
+    $deadline   = !empty($activity['deadline']) ? substr((string) $activity['deadline'], 0, 16) : '不限';
+    $idPrefix   = 'signup-' . $activityId . '-';
+
+    $html  = '<section class="activity-signup" id="activity-' . $activityId . '">';
+    $html .= '<div class="activity-signup-head"><h2>活动报名</h2><p>报名截止：' . h($deadline)
+        . ' · 已报名 <span class="activity-entry-count">' . h((string) $entryCount) . '</span> 人</p></div>';
+
+    if (!$status['open']) {
+        $html .= '<div class="notice notice-warn"><strong>' . h($status['label']) . '</strong><span>'
+            . h($status['message']) . '</span></div></section>';
+        return $html;
+    }
+
+    $html .= '<form class="activity-signup-form" method="post" action="activity.php" enctype="multipart/form-data">';
+    $html .= '<input type="hidden" name="csrf_token" value="' . h(csrf_token()) . '">';
+    $html .= '<input type="hidden" name="action" value="signup">';
+    $html .= '<input type="hidden" name="activity_id" value="' . $activityId . '">';
+    $html .= '<input type="hidden" name="return_article" value="' . $returnArticleId . '">';
+    $html .= '<div class="form-row">';
+    $html .= '<div class="field"><label for="' . $idPrefix . 'name">姓名</label>'
+        . '<input class="input" id="' . $idPrefix . 'name" type="text" name="name" maxlength="50" required></div>';
+    $html .= '<div class="field"><label for="' . $idPrefix . 'class">班级</label>'
+        . '<input class="input" id="' . $idPrefix . 'class" type="text" name="class_name" maxlength="50" required></div>';
+    $html .= '</div>';
+    $html .= '<div class="form-row">';
+    $html .= '<div class="field"><label for="' . $idPrefix . 'no">学号</label>'
+        . '<input class="input" id="' . $idPrefix . 'no" type="text" name="student_no" maxlength="50" required></div>';
+    $html .= '<div class="field"><label for="' . $idPrefix . 'file">上传文件</label>'
+        . '<input class="input activity-file-input" id="' . $idPrefix . 'file" type="file" name="file"'
+        . ' accept="video/*,.pdf,.doc,.docx,.zip,.rar,.jpg,.jpeg,.png" required>'
+        . '<span class="field-hint">支持视频或文档，单个文件不超过 200MB。</span></div>';
+    $html .= '</div>';
+    $html .= render_activity_custom_fields(get_activity_fields(db(), $activityId));
+    $html .= '<div class="upload-progress" hidden>';
+    $html .= '<div class="upload-progress-track"><span class="upload-progress-bar"></span></div>';
+    $html .= '<span class="upload-progress-text">0%</span>';
+    $html .= '</div>';
+    $html .= '<div class="form-actions"><button class="btn btn-primary" type="submit">提交报名</button>'
+        . '<span class="upload-status" role="status"></span></div>';
+    $html .= '</form></section>';
+
+    return $html;
+}
+
+function activity_field_types(): array
+{
+    return [
+        'text'     => '单行文本',
+        'textarea' => '多行文本',
+        'number'   => '数字',
+        'date'     => '日期',
+        'email'    => '邮箱',
+        'tel'      => '电话',
+        'select'   => '下拉选择',
+        'radio'    => '单选',
+        'checkbox' => '多选',
+    ];
+}
+
+function get_activity_fields(PDO $db, int $activityId): array
+{
+    $stmt = $db->prepare(
+        'SELECT * FROM `activity_fields` WHERE `activity_id` = ? ORDER BY `sort_order` ASC, `id` ASC'
+    );
+    $stmt->execute([$activityId]);
+
+    return $stmt->fetchAll();
+}
+
+function activity_field_options(array $field): array
+{
+    $lines = preg_split('/\r\n|\r|\n/', (string) ($field['options'] ?? ''));
+    if (!is_array($lines)) {
+        return [];
+    }
+
+    $options = [];
+    foreach ($lines as $line) {
+        $line = trim((string) $line);
+        if ($line !== '') {
+            $options[] = $line;
+        }
+    }
+
+    return $options;
+}
+
+function render_activity_custom_fields(array $fields): string
+{
+    if (!$fields) {
+        return '';
+    }
+
+    $types = activity_field_types();
+    $html  = '<div class="activity-custom-fields">';
+
+    foreach ($fields as $field) {
+        $fieldId    = (int) $field['id'];
+        $type       = strtolower((string) $field['field_type']);
+        $type       = isset($types[$type]) ? $type : 'text';
+        $label      = (string) $field['label'];
+        $required   = (int) $field['required'] === 1;
+        $inputId    = 'cf-' . $fieldId;
+        $name       = 'custom[' . $fieldId . ']';
+        $placeholder = (string) $field['placeholder'];
+        $help       = (string) $field['help_text'];
+        $options    = activity_field_options($field);
+        $requiredAttr = $required ? ' required' : '';
+
+        $html .= '<div class="field activity-custom-field">';
+        $html .= '<label for="' . $inputId . '">' . h($label)
+            . ($required ? '<span class="required-mark">*</span>' : '') . '</label>';
+
+        if ($type === 'textarea') {
+            $html .= '<textarea class="input textarea" id="' . $inputId . '" name="' . $name . '" maxlength="5000"'
+                . ($placeholder !== '' ? ' placeholder="' . h($placeholder) . '"' : '')
+                . $requiredAttr . '></textarea>';
+        } elseif ($type === 'select') {
+            $html .= '<select class="input" id="' . $inputId . '" name="' . $name . '"' . $requiredAttr . '>';
+            $html .= '<option value="">请选择</option>';
+            foreach ($options as $option) {
+                $html .= '<option value="' . h($option) . '">' . h($option) . '</option>';
+            }
+            $html .= '</select>';
+        } elseif ($type === 'radio' || $type === 'checkbox') {
+            $inputName = $type === 'checkbox' ? $name . '[]' : $name;
+            $html .= '<div class="choice-group" id="' . $inputId . '">';
+            foreach ($options as $index => $option) {
+                $optionId = $inputId . '-' . $index;
+                $html .= '<label class="choice-item" for="' . $optionId . '">';
+                $html .= '<input type="' . ($type === 'checkbox' ? 'checkbox' : 'radio') . '"'
+                    . ' id="' . $optionId . '" name="' . $inputName . '" value="' . h($option) . '"'
+                    . ($type === 'radio' ? $requiredAttr : '') . '>';
+                $html .= '<span>' . h($option) . '</span></label>';
+            }
+            $html .= '</div>';
+        } else {
+            $inputType = in_array($type, ['number', 'date', 'email', 'tel'], true) ? $type : 'text';
+            $maxLength = in_array($type, ['text', 'email', 'tel'], true) ? ' maxlength="200"' : '';
+            $step      = $type === 'number' ? ' step="any"' : '';
+            $html .= '<input class="input" id="' . $inputId . '" type="' . $inputType . '" name="' . $name . '"'
+                . $maxLength . $step
+                . ($placeholder !== '' ? ' placeholder="' . h($placeholder) . '"' : '')
+                . $requiredAttr . '>';
+        }
+
+        if ($help !== '') {
+            $html .= '<span class="field-hint">' . h($help) . '</span>';
+        }
+
+        $html .= '</div>';
+    }
+
+    $html .= '</div>';
+
+    return $html;
+}
+
+function collect_activity_custom_values(PDO $db, int $activityId, array $input, array &$errors): array
+{
+    $fields = get_activity_fields($db, $activityId);
+    $types  = activity_field_types();
+    $values = [];
+
+    foreach ($fields as $field) {
+        $fieldId  = (int) $field['id'];
+        $type     = strtolower((string) $field['field_type']);
+        $type     = isset($types[$type]) ? $type : 'text';
+        $label    = (string) $field['label'];
+        $required = (int) $field['required'] === 1;
+        $options  = activity_field_options($field);
+        $raw      = $input[$fieldId] ?? null;
+
+        if ($type === 'checkbox') {
+            $selected = [];
+
+            if (is_array($raw)) {
+                foreach ($raw as $item) {
+                    if (!is_string($item)) {
+                        continue;
+                    }
+                    $item = trim($item);
+                    if ($item === '') {
+                        continue;
+                    }
+                    if (!in_array($item, $options, true)) {
+                        $errors[] = "「{$label}」的选项无效。";
+                        $selected = [];
+                        break;
+                    }
+                    $selected[] = $item;
+                }
+                $selected = array_values(array_slice(array_unique($selected), 0, 50));
+            }
+
+            if ($required && !$selected) {
+                $errors[] = "请选择「{$label}」。";
+            }
+
+            $values[] = ['label' => $label, 'value' => $selected];
+            continue;
+        }
+
+        $value     = is_string($raw) ? trim($raw) : '';
+        $maxLength = $type === 'textarea' ? 5000 : 200;
+
+        if (text_length($value) > $maxLength) {
+            $errors[] = "「{$label}」不能超过 {$maxLength} 个字符。";
+        }
+
+        if ($value === '') {
+            if ($required) {
+                $errors[] = "请填写「{$label}」。";
+            }
+            $values[] = ['label' => $label, 'value' => ''];
+            continue;
+        }
+
+        if ($type === 'number' && !is_numeric($value)) {
+            $errors[] = "「{$label}」需填写数字。";
+        } elseif ($type === 'date') {
+            $date = DateTime::createFromFormat('Y-m-d', $value);
+            if ($date === false || $date->format('Y-m-d') !== $value) {
+                $errors[] = "「{$label}」日期格式不正确。";
+            }
+        } elseif ($type === 'email' && filter_var($value, FILTER_VALIDATE_EMAIL) === false) {
+            $errors[] = "「{$label}」邮箱格式不正确。";
+        } elseif (($type === 'select' || $type === 'radio') && !in_array($value, $options, true)) {
+            $errors[] = "「{$label}」的选项无效。";
+        }
+
+        $values[] = ['label' => $label, 'value' => $value];
+    }
+
+    return $values;
+}
+
+function special_status_label(string $status): string
+{
+    $labels = ['pending' => '待审核', 'approved' => '已通过', 'rejected' => '已拒绝'];
+
+    return $labels[$status] ?? '待审核';
+}
+
+function special_status_class(string $status): string
+{
+    if ($status === 'approved') {
+        return 'badge-approved';
+    }
+    if ($status === 'rejected') {
+        return 'badge-rejected';
+    }
+
+    return 'badge-pending';
+}
+
+function audit_log(
+    string $action,
+    string $category,
+    string $targetType = '',
+    $targetId = '',
+    string $detail = '',
+    string $actor = '',
+    string $actorType = ''
+): void {
+    try {
+        if ($actor === '') {
+            if (!empty($_SESSION['admin_authenticated'])) {
+                $actor = trim((string) ($_SESSION['admin_display'] ?? ''));
+                if ($actor === '') {
+                    $actor = '管理员';
+                }
+                if ($actorType === '') {
+                    $actorType = 'admin';
+                }
+            } else {
+                $actor = '系统';
+                if ($actorType === '') {
+                    $actorType = 'system';
+                }
+            }
+        }
+
+        if ($actorType === '') {
+            $actorType = 'admin';
+        }
+
+        $detail = trim($detail);
+        if (text_length($detail) > 500) {
+            $detail = function_exists('mb_substr')
+                ? mb_substr($detail, 0, 500, 'UTF-8')
+                : substr($detail, 0, 500);
+        }
+
+        $fingerprint = '';
+        $rawFingerprint = (string) ($_COOKIE['device_fp'] ?? '');
+        if (preg_match('/^[a-f0-9]{16,64}$/i', $rawFingerprint) === 1) {
+            $fingerprint = strtolower($rawFingerprint);
+        }
+
+        $stmt = db()->prepare(
+            'INSERT INTO `audit_logs`
+                (`actor`, `actor_type`, `action`, `category`, `target_type`, `target_id`, `detail`, `ip`, `fingerprint`)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        $stmt->execute([
+            $actor,
+            $actorType,
+            $action,
+            $category,
+            $targetType,
+            (string) $targetId,
+            $detail,
+            (string) ($_SERVER['REMOTE_ADDR'] ?? ''),
+            $fingerprint,
+        ]);
+    } catch (Throwable $e) {
+        error_log('audit log failed: ' . $e->getMessage());
+    }
+}
+
+function render_activity_link(array $activity): string
+{
+    $activityId = (int) $activity['id'];
+    $entryCount = activity_entry_count(db(), $activityId);
+    $status     = activity_status($activity, $entryCount);
+    $deadline   = !empty($activity['deadline']) ? substr((string) $activity['deadline'], 0, 16) : '不限';
+    $buttonText = $status['open'] ? '立即报名' : $status['label'];
+
+    $html  = '<a class="activity-jump" href="activity.php?id=' . $activityId . '">';
+    $html .= '<span class="activity-jump-main">';
+    $html .= '<span class="activity-jump-tag">活动报名</span>';
+    $html .= '<strong>' . h($activity['title']) . '</strong>';
+    $html .= '<span class="activity-jump-meta">报名截止：' . h($deadline)
+        . ' · 已报名 ' . h((string) $entryCount) . ' 人</span>';
+    $html .= '</span>';
+    $html .= '<span class="activity-jump-btn">' . h($buttonText) . ' →</span>';
+    $html .= '</a>';
+
+    return $html;
+}
+
+function render_article_content(PDO $db, string $content, int $articleId, string $format = 'text'): string
+{
+    if ($format === 'html') {
+        $html = sanitize_article_html($content);
+        $html = (string) preg_replace_callback(
+            '#<p>\s*\[activity:(\d+)\]\s*</p>#iu',
+            function (array $matches) use ($db): string {
+                $activity = get_activity($db, (int) $matches[1]);
+                return $activity !== null ? render_activity_link($activity) : '';
+            },
+            $html
+        );
+        $html = (string) preg_replace_callback(
+            '/\[activity:(\d+)\]/u',
+            function (array $matches) use ($db): string {
+                $activity = get_activity($db, (int) $matches[1]);
+                return $activity !== null ? render_activity_link($activity) : '';
+            },
+            $html
+        );
+
+        return $html;
+    }
+
+    $parts = preg_split('/(\[activity:\d+\])/u', $content, -1, PREG_SPLIT_DELIM_CAPTURE);
+    if (!is_array($parts)) {
+        return h($content);
+    }
+
+    $html = '';
+    foreach ($parts as $part) {
+        if (preg_match('/^\[activity:(\d+)\]$/', $part, $matches)) {
+            $activity = get_activity($db, (int) $matches[1]);
+            if ($activity !== null) {
+                $html .= render_activity_link($activity);
+            }
+            continue;
+        }
+        $html .= h($part);
+    }
+
+    return $html;
+}
+
+/**
  * 输出致命错误页面并退出
  */
 function render_fatal_error(string $message, string $detail = ''): void
@@ -220,6 +882,153 @@ function init_schema(PDO $pdo): void
     );
 
     $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `majors` (
+            `id`         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name`       VARCHAR(50)  NOT NULL COMMENT '专业名称',
+            `sort_order` INT UNSIGNED NOT NULL DEFAULT 1 COMMENT '显示顺序',
+            `created_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_name` (`name`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `classes` (
+            `id`         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `major_id`   INT UNSIGNED NOT NULL COMMENT '所属专业',
+            `name`       VARCHAR(50)  NOT NULL COMMENT '班级名称',
+            `sort_order` INT UNSIGNED NOT NULL DEFAULT 1 COMMENT '显示顺序',
+            `created_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_name` (`name`),
+            KEY `idx_major_order` (`major_id`, `sort_order`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `articles` (
+            `id`           INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `title`        VARCHAR(120) NOT NULL COMMENT '文章标题',
+            `summary`      VARCHAR(255) NOT NULL DEFAULT '' COMMENT '文章摘要',
+            `cover_url`    VARCHAR(500) NOT NULL DEFAULT '' COMMENT '封面图片地址',
+            `content`      MEDIUMTEXT   NOT NULL COMMENT '文章正文',
+            `content_format` VARCHAR(10) NOT NULL DEFAULT 'text' COMMENT '正文格式',
+            `is_published` TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否发布',
+            `published_at` DATETIME     NULL COMMENT '发布时间',
+            `created_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_published` (`is_published`, `published_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `activity_submissions` (
+            `id`            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `activity_id`   INT UNSIGNED NOT NULL,
+            `name`          VARCHAR(50)  NOT NULL,
+            `class_name`    VARCHAR(50)  NOT NULL,
+            `student_no`    VARCHAR(50)  NOT NULL,
+            `file_path`     VARCHAR(255) NOT NULL,
+            `original_name` VARCHAR(255) NOT NULL,
+            `file_size`     INT UNSIGNED NOT NULL DEFAULT 0,
+            `mime_type`     VARCHAR(100) NOT NULL DEFAULT '',
+            `form_data`     MEDIUMTEXT   NULL COMMENT '自定义字段填写内容（JSON）',
+            `created_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_activity` (`activity_id`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `activity_fields` (
+            `id`           INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `activity_id`  INT UNSIGNED NOT NULL,
+            `label`        VARCHAR(80)  NOT NULL COMMENT '字段名称',
+            `field_type`   VARCHAR(20)  NOT NULL DEFAULT 'text' COMMENT '字段类型',
+            `required`     TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否必填',
+            `options`      TEXT         NOT NULL COMMENT '选项，每行一个',
+            `placeholder`  VARCHAR(120) NOT NULL DEFAULT '',
+            `help_text`    VARCHAR(255) NOT NULL DEFAULT '',
+            `sort_order`   INT UNSIGNED NOT NULL DEFAULT 1,
+            `created_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_activity_order` (`activity_id`, `sort_order`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `audit_logs` (
+            `id`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `actor`       VARCHAR(80)  NOT NULL DEFAULT '' COMMENT '操作人',
+            `actor_type`  VARCHAR(20)  NOT NULL DEFAULT 'admin' COMMENT '操作人类型',
+            `action`      VARCHAR(30)  NOT NULL DEFAULT '' COMMENT '操作类型',
+            `category`    VARCHAR(30)  NOT NULL DEFAULT '' COMMENT '业务分类',
+            `target_type` VARCHAR(40)  NOT NULL DEFAULT '' COMMENT '对象类型',
+            `target_id`   VARCHAR(40)  NOT NULL DEFAULT '' COMMENT '对象 ID',
+            `detail`      VARCHAR(500) NOT NULL DEFAULT '' COMMENT '操作详情',
+            `ip`          VARCHAR(45)  NOT NULL DEFAULT '' COMMENT '来源 IP',
+            `fingerprint` VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '浏览器指纹',
+            `created_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_created` (`created_at`),
+            KEY `idx_category` (`category`, `id`),
+            KEY `idx_action` (`action`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `special_presets` (
+            `id`         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name`       VARCHAR(80)  NOT NULL COMMENT '预制播音名称',
+            `content`    MEDIUMTEXT   NOT NULL COMMENT '预置播稿内容',
+            `sort_order` INT UNSIGNED NOT NULL DEFAULT 1,
+            `created_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_name` (`name`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `special_broadcasts` (
+            `id`             INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `class_name`     VARCHAR(50)  NOT NULL,
+            `title`          VARCHAR(120) NOT NULL,
+            `content`        MEDIUMTEXT   NOT NULL,
+            `broadcast_date` DATE         NULL,
+            `uploader_name`  VARCHAR(50)  NOT NULL DEFAULT '',
+            `uploader_no`    VARCHAR(50)  NOT NULL DEFAULT '',
+            `status`         VARCHAR(20)  NOT NULL DEFAULT 'pending',
+            `reject_reason`  VARCHAR(255) NOT NULL DEFAULT '',
+            `reviewer_name`  VARCHAR(50)  NOT NULL DEFAULT '',
+            `reviewed_at`    DATETIME     NULL,
+            `created_at`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_class` (`class_name`, `id`),
+            KEY `idx_status` (`status`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `activities` (
+            `id`          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `title`       VARCHAR(150) NOT NULL,
+            `subtitle`    VARCHAR(255) NOT NULL DEFAULT '',
+            `cover_url`   VARCHAR(500) NOT NULL DEFAULT '',
+            `content`     MEDIUMTEXT   NOT NULL,
+            `is_open`     TINYINT(1)   NOT NULL DEFAULT 1,
+            `deadline`    DATETIME     NULL,
+            `max_entries` INT UNSIGNED NOT NULL DEFAULT 0,
+            `created_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_open` (`is_open`, `deadline`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
         "CREATE TABLE IF NOT EXISTS `verified_uploaders` (
             `id`         INT UNSIGNED NOT NULL AUTO_INCREMENT,
             `uid`        VARCHAR(20)  NOT NULL COMMENT 'B站用户 UID',
@@ -242,6 +1051,101 @@ function init_schema(PDO $pdo): void
 
     // 管理员账号由首次使用时自行设置，不再写入默认账号。
     migrate_song_columns($pdo);
+    migrate_majors_and_classes($pdo);
+    migrate_article_columns($pdo);
+    migrate_activity_columns($pdo);
+    migrate_audit_log_columns($pdo);
+}
+
+function migrate_audit_log_columns(PDO $pdo): void
+{
+    $columns  = $pdo->query('SHOW COLUMNS FROM `audit_logs`')->fetchAll();
+    $existing = [];
+    foreach ($columns as $column) {
+        $existing[$column['Field']] = true;
+    }
+
+    if (!isset($existing['fingerprint'])) {
+        $pdo->exec(
+            "ALTER TABLE `audit_logs`
+             ADD COLUMN `fingerprint` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '浏览器指纹' AFTER `ip`"
+        );
+    }
+}
+
+function migrate_activity_columns(PDO $pdo): void
+{
+    $columns  = $pdo->query('SHOW COLUMNS FROM `activity_submissions`')->fetchAll();
+    $existing = [];
+    foreach ($columns as $column) {
+        $existing[$column['Field']] = true;
+    }
+
+    if (!isset($existing['form_data'])) {
+        $pdo->exec(
+            "ALTER TABLE `activity_submissions`
+             ADD COLUMN `form_data` MEDIUMTEXT NULL COMMENT '自定义字段填写内容（JSON）' AFTER `mime_type`"
+        );
+    }
+}
+
+function migrate_article_columns(PDO $pdo): void
+{
+    $columns  = $pdo->query('SHOW COLUMNS FROM `articles`')->fetchAll();
+    $existing = [];
+    foreach ($columns as $column) {
+        $existing[$column['Field']] = true;
+    }
+
+    if (!isset($existing['content_format'])) {
+        $pdo->exec(
+            "ALTER TABLE `articles`
+             ADD COLUMN `content_format` VARCHAR(10) NOT NULL DEFAULT 'text' AFTER `content`"
+        );
+    }
+}
+
+/**
+ * 将旧版本中直接填写的班级名称迁移到“专业 / 班级”设置中
+ */
+function migrate_majors_and_classes(PDO $pdo): void
+{
+    $majorCount = (int) $pdo->query('SELECT COUNT(*) FROM `majors`')->fetchColumn();
+    $classCount = (int) $pdo->query('SELECT COUNT(*) FROM `classes`')->fetchColumn();
+    if ($majorCount > 0 || $classCount > 0) {
+        return;
+    }
+
+    $names = $pdo->query(
+        "SELECT DISTINCT `class_name` FROM `songs` WHERE `class_name` <> '' ORDER BY `class_name` ASC"
+    )->fetchAll(PDO::FETCH_COLUMN);
+
+    if (!$names) {
+        return;
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $insertMajor = $pdo->prepare(
+            'INSERT INTO `majors` (`name`, `sort_order`) VALUES (?, ?)'
+        );
+        $insertMajor->execute(['未分类专业', 1]);
+        $majorId = (int) $pdo->lastInsertId();
+
+        $insertClass = $pdo->prepare(
+            'INSERT INTO `classes` (`major_id`, `name`, `sort_order`) VALUES (?, ?, ?)'
+        );
+        foreach ($names as $index => $name) {
+            $insertClass->execute([$majorId, (string) $name, $index + 1]);
+        }
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
 }
 
 /**
@@ -401,7 +1305,7 @@ function status_label(string $status): string
         return '待重新审核';
     }
     if ($status === STATUS_REJECTED) {
-        return '未通过';
+        return '拒绝';
     }
 
     return '待审核';
@@ -438,12 +1342,7 @@ function admin_credentials_configured(): bool
     $accountHash  = setting('admin_username_hash', '');
     $passwordHash = setting('admin_password_hash', '');
 
-    if ($accountHash === '' || $passwordHash === '') {
-        return false;
-    }
-
-    return $accountHash !== ADMIN_LEGACY_USERNAME_HASH
-        && $passwordHash !== ADMIN_LEGACY_PASSWORD_HASH;
+    return $accountHash !== '' && $passwordHash !== '';
 }
 
 /**
@@ -486,6 +1385,64 @@ function normalize_match_text(string $value): string
     $normalized = preg_replace('/[\s\p{P}\p{S}]+/u', '', $value);
 
     return $normalized === null ? '' : $normalized;
+}
+
+/**
+ * 读取专业及其下属班级（按显示顺序）
+ *
+ * @return array<int, array{id: int, name: string, sort_order: int, classes: array<int, array{id: int, name: string, sort_order: int}>}>
+ */
+function get_majors_with_classes(PDO $db): array
+{
+    $majors = $db->query(
+        'SELECT `id`, `name`, `sort_order` FROM `majors` ORDER BY `sort_order` ASC, `id` ASC'
+    )->fetchAll();
+
+    $classes = $db->query(
+        'SELECT `id`, `major_id`, `name`, `sort_order` FROM `classes`
+         ORDER BY `sort_order` ASC, `id` ASC'
+    )->fetchAll();
+
+    $grouped = [];
+    foreach ($majors as $major) {
+        $grouped[(int) $major['id']] = [
+            'id'         => (int) $major['id'],
+            'name'       => (string) $major['name'],
+            'sort_order' => (int) $major['sort_order'],
+            'classes'    => [],
+        ];
+    }
+
+    foreach ($classes as $class) {
+        $majorId = (int) $class['major_id'];
+        if (!isset($grouped[$majorId])) {
+            continue;
+        }
+        $grouped[$majorId]['classes'][] = [
+            'id'         => (int) $class['id'],
+            'name'       => (string) $class['name'],
+            'sort_order' => (int) $class['sort_order'],
+        ];
+    }
+
+    return array_values($grouped);
+}
+
+/**
+ * 按名称查找班级设置记录
+ */
+function find_class_record(PDO $db, string $className): ?array
+{
+    $stmt = $db->prepare(
+        'SELECT `c`.`id`, `c`.`name`, `c`.`major_id`, `m`.`name` AS `major_name`
+         FROM `classes` `c`
+         INNER JOIN `majors` `m` ON `m`.`id` = `c`.`major_id`
+         WHERE `c`.`name` = ? LIMIT 1'
+    );
+    $stmt->execute([$className]);
+    $record = $stmt->fetch();
+
+    return $record === false ? null : $record;
 }
 
 /**

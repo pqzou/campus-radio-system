@@ -2,7 +2,77 @@
 declare(strict_types=1);
 require_once __DIR__ . '/lib/bootstrap.php';
 
+if (!admin_is_logged_in()) {
+    flash('error', '请先登录管理员账号。');
+    redirect('settings.php');
+}
+
 $db = db();
+
+$specialReviewRedirect = static function () use ($db): void {
+    $remaining = (int) $db->query(
+        "SELECT COUNT(*) FROM `special_broadcasts` WHERE `status` = 'pending'"
+    )->fetchColumn();
+
+    redirect($remaining > 0 ? 'player.php?review=1' : 'player.php');
+};
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    verify_csrf();
+
+    $action = (string) ($_POST['action'] ?? '');
+    $id     = (int) ($_POST['id'] ?? 0);
+
+    $stmt = $db->prepare('SELECT `title` FROM `special_broadcasts` WHERE `id` = ? LIMIT 1');
+    $stmt->execute([$id]);
+    $reviewItem = $stmt->fetch();
+    $itemTitle  = $reviewItem !== false ? (string) $reviewItem['title'] : '未知';
+
+    if ($action === 'special_delete') {
+        $stmt = $db->prepare('DELETE FROM `special_broadcasts` WHERE `id` = ?');
+        $stmt->execute([$id]);
+        audit_log('delete', 'special', '特殊播音', $id, "删除特殊播音「{$itemTitle}」");
+        flash('success', '特殊播音记录已删除。');
+        $specialReviewRedirect();
+    }
+
+    if ($action === 'special_approve' || $action === 'special_reject') {
+        if ($action === 'special_approve') {
+            $stmt = $db->prepare(
+                "UPDATE `special_broadcasts`
+                 SET `status` = 'approved', `reject_reason` = '', `reviewer_name` = '广播室',
+                     `reviewed_at` = NOW(), `updated_at` = NOW()
+                 WHERE `id` = ?"
+            );
+            $stmt->execute([$id]);
+            audit_log('approve', 'special', '特殊播音', $id, "通过特殊播音「{$itemTitle}」");
+            flash('success', '已通过该特殊播音申请。');
+        } else {
+            $reason = trim((string) ($_POST['reject_reason'] ?? ''));
+
+            if ($reason === '') {
+                flash('error', '请填写拒绝原因。');
+            } elseif (text_length($reason) > 200) {
+                flash('error', '拒绝原因不能超过 200 个字符。');
+            } else {
+                $stmt = $db->prepare(
+                    "UPDATE `special_broadcasts`
+                     SET `status` = 'rejected', `reject_reason` = ?, `reviewer_name` = '广播室',
+                         `reviewed_at` = NOW(), `updated_at` = NOW()
+                     WHERE `id` = ?"
+                );
+                $stmt->execute([$reason, $id]);
+                audit_log('reject', 'special', '特殊播音', $id, "拒绝特殊播音「{$itemTitle}」：{$reason}");
+                flash('success', '已拒绝该特殊播音申请。');
+            }
+        }
+
+        redirect('player.php?review=1');
+    }
+
+    flash('error', '未知操作。');
+    redirect('player.php');
+}
 
 $approvedSongs = $db->query(
     "SELECT `id`, `class_name`, `title`, `bvid`, `remark`, `duration`, `progress_seconds`, `completed_at`
@@ -55,6 +125,34 @@ foreach ($pendingSongs as $song) {
     ];
 }
 
+$specialFilter = (string) ($_GET['special_status'] ?? '');
+if (!in_array($specialFilter, ['', 'pending', 'approved', 'rejected'], true)) {
+    $specialFilter = '';
+}
+
+if ($specialFilter !== '') {
+    $specialStmt = $db->prepare(
+        "SELECT * FROM `special_broadcasts` WHERE `status` = ? ORDER BY (`status` = 'pending') DESC, `id` DESC"
+    );
+    $specialStmt->execute([$specialFilter]);
+} else {
+    $specialStmt = $db->query(
+        "SELECT * FROM `special_broadcasts` ORDER BY (`status` = 'pending') DESC, `id` DESC"
+    );
+}
+$specialItems = $specialStmt->fetchAll();
+
+$specialCounts = ['pending' => 0, 'approved' => 0, 'rejected' => 0, 'all' => 0];
+foreach ($db->query('SELECT `status`, COUNT(*) AS `c` FROM `special_broadcasts` GROUP BY `status`')->fetchAll() as $row) {
+    $key = (string) $row['status'];
+    if (isset($specialCounts[$key])) {
+        $specialCounts[$key] = (int) $row['c'];
+    }
+    $specialCounts['all'] += (int) $row['c'];
+}
+
+$reviewOpen = isset($_GET['review']) || isset($_GET['special']) || $specialFilter !== '';
+
 $jsonFlags = JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
 $playlistJson  = json_encode($playlist, $jsonFlags);
 $pendingJson   = json_encode($pendingList, $jsonFlags);
@@ -78,40 +176,27 @@ foreach ($playlist as $item) {
         $activeCount++;
     }
 }
-$completedCount = $approvedCount - $activeCount;
+$pageTitle = '大屏播放与审核';
+$activeNav = 'player';
+require __DIR__ . '/includes/header.php';
 ?>
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <title>音乐播放与审核 - <?= h(site_text('header_title')) ?></title>
-    <link rel="stylesheet" href="assets/css/style.css?v=12">
-</head>
-<body class="player-body">
-<div class="player-shell">
-    <header class="player-header">
-        <a class="player-brand" href="upload.php">
-            <img class="school-logo" src="assets/img/school-logo.png" alt="学校校徽"
-                 onerror="this.onerror=null;this.src='assets/img/school-logo-placeholder.svg';">
-            <span class="player-brand-text">
-                <strong><?= h(site_text('header_title')) ?></strong>
-            </span>
-        </a>
-        <div class="player-head-right">
-            <span class="player-stat">已通过 <b><?= h((string) $approvedCount) ?></b> 首</span>
-            <span class="player-stat is-warn">待审核 <b id="pendingCountBadge"><?= h((string) $pendingCount) ?></b> 首</span>
-            <button class="player-link-btn" id="openReviewBtn" type="button"
-                <?= $pendingCount === 0 ? 'hidden' : '' ?>>审核待处理</button>
-            <span class="player-clock" id="clock">--:--:--</span>
-            <a class="player-link" href="settings.php">系统设置</a>
-            <a class="player-link" href="upload.php">班级上传</a>
-            <button class="player-link-btn" id="refreshBtn" type="button">刷新</button>
-        </div>
-    </header>
 
-    <main class="player-layout">
+<div class="page-head player-page-head">
+    <div>
+        <p class="eyebrow">广播室</p>
+        <h1 class="page-title">大屏播放与审核</h1>
+    </div>
+    <div class="page-head-actions player-head-actions">
+        <span class="player-stat">已通过 <b><?= h((string) $approvedCount) ?></b> 首</span>
+        <span class="player-stat is-warn">待审核 <b id="pendingCountBadge"><?= h((string) $pendingCount) ?></b> 首</span>
+        <button class="btn btn-primary btn-sm" id="openReviewBtn" type="button"
+            <?= ($pendingCount === 0 && $specialCounts['pending'] === 0) ? 'hidden' : '' ?>>审核待处理</button>
+        <button class="btn btn-secondary btn-sm" id="refreshBtn" type="button">刷新</button>
+        <span class="player-clock" id="clock">--:--:--</span>
+    </div>
+</div>
+
+<div class="player-layout">
         <section class="player-stage" aria-label="播放区域">
             <div class="screen-wrap" id="screenWrap">
                 <iframe
@@ -130,11 +215,9 @@ $completedCount = $approvedCount - $activeCount;
                 <div class="start-overlay" id="startOverlay">
                     <?php if ($activeCount > 0): ?>
                         <div class="start-card">
-                            <p class="start-eyebrow">校园广播站</p>
                             <h1>校园音乐点播</h1>
-                            <p class="start-sub">待播放 <?= h((string) $activeCount) ?> 首 · 已完成 <?= h((string) $completedCount) ?> 首</p>
+                            <p class="start-sub">待播放 <?= h((string) $activeCount) ?> 首</p>
                             <button class="start-btn" id="startBtn" type="button">开始播放</button>
-                            <p class="start-hint">若未自动播放，请点击视频画面中的播放按钮。播放进度会自动记录。</p>
                         </div>
                     <?php elseif ($approvedCount > 0): ?>
                         <div class="start-card is-empty">
@@ -199,28 +282,128 @@ $completedCount = $approvedCount - $activeCount;
             <div class="playlist-filter" id="playlistFilter" role="group" aria-label="按班级筛选播放顺序"></div>
             <ol class="playlist" id="playlist"></ol>
 
-            <div class="completed-panel" id="completedPanel" hidden>
-                <div class="completed-head">
-                    <h3>已播放完毕</h3>
+            <details class="completed-panel" id="completedPanel" hidden open>
+                <summary class="completed-head">
+                    <h3>已播放完毕<span class="completed-chevron" aria-hidden="true">▾</span></h3>
                     <span id="completedCount">0</span>
-                </div>
+                </summary>
                 <ol class="completed-list" id="completedList"></ol>
-            </div>
+            </details>
         </aside>
-    </main>
 </div>
+
 
 <div class="review-backdrop" id="reviewModal" hidden>
     <div class="review-dialog" role="dialog" aria-modal="true" aria-labelledby="reviewDialogTitle">
         <div class="review-dialog-head">
             <div>
                 <h2 id="reviewDialogTitle">节目审核</h2>
-                <p>待审核 <strong id="reviewPendingCount"><?= h((string) $pendingCount) ?></strong> 首 · 审核结果立即保存</p>
+                <p>特殊播音待审核 <strong><?= h((string) $specialCounts['pending']) ?></strong> 条 · 歌曲待审核
+                    <strong id="reviewPendingCount"><?= h((string) $pendingCount) ?></strong> 首</p>
             </div>
             <button class="review-close" id="reviewCloseBtn" type="button">关闭</button>
         </div>
 
         <div class="review-dialog-body">
+            <section id="specialStage" hidden>
+                <div class="review-stage-head">
+                    <h3>一、特殊播音审核</h3>
+                    <p>共 <?= h((string) $specialCounts['all']) ?> 条，待审核 <?= h((string) $specialCounts['pending']) ?> 条。处理完后可继续歌曲审核。</p>
+                </div>
+
+                <nav class="song-tabs" aria-label="特殊播音状态筛选">
+                    <?php
+                    $specialFilters = [
+                        ''         => ['label' => '全部', 'count' => $specialCounts['all']],
+                        'pending'  => ['label' => '待审核', 'count' => $specialCounts['pending']],
+                        'approved' => ['label' => '已通过', 'count' => $specialCounts['approved']],
+                        'rejected' => ['label' => '已拒绝', 'count' => $specialCounts['rejected']],
+                    ];
+                    ?>
+                    <?php foreach ($specialFilters as $key => $item): ?>
+                        <a class="song-tab <?= $specialFilter === $key ? 'is-active' : '' ?>"
+                           href="player.php?review=1<?= $key !== '' ? '&amp;special_status=' . h($key) : '' ?>">
+                            <?= h($item['label']) ?><span class="song-tab-count"><?= h((string) $item['count']) ?></span>
+                        </a>
+                    <?php endforeach; ?>
+                </nav>
+
+                <?php if (!$specialItems): ?>
+                    <div class="empty-state">
+                        <h3>暂无特殊播音申请</h3>
+                    </div>
+                <?php else: ?>
+                    <div class="special-review-list">
+                        <?php foreach ($specialItems as $item): ?>
+                            <?php
+                            $status = (string) $item['status'];
+                            $date   = !empty($item['broadcast_date']) ? substr((string) $item['broadcast_date'], 0, 10) : '不限';
+                            ?>
+                            <article class="special-review-item">
+                                <div class="special-review-head">
+                                    <div>
+                                        <strong><?= h($item['title']) ?></strong>
+                                        <span class="badge <?= h(special_status_class($status)) ?>"><?= h(special_status_label($status)) ?></span>
+                                    </div>
+                                    <span class="sub-text"><?= h(substr((string) $item['created_at'], 0, 16)) ?></span>
+                                </div>
+
+                                <p class="special-review-meta">
+                                    <span>期望播出：<?= h($date) ?></span>
+                                    <span>提交人：<?= h($item['uploader_name']) ?>（<?= h($item['uploader_no']) ?>）</span>
+                                    <?php if (!empty($item['reviewed_at'])): ?>
+                                        <span>审核时间：<?= h(substr((string) $item['reviewed_at'], 0, 16)) ?></span>
+                                    <?php endif; ?>
+                                </p>
+
+                                <details class="special-review-content">
+                                    <summary>查看播稿内容</summary>
+                                    <p><?= nl2br(h((string) $item['content'])) ?></p>
+                                </details>
+
+                                <?php if ($status === 'rejected' && trim((string) $item['reject_reason']) !== ''): ?>
+                                    <p class="form-error">拒绝原因：<?= h($item['reject_reason']) ?></p>
+                                <?php endif; ?>
+
+                                <div class="special-review-actions">
+                                    <?php if ($status !== 'approved'): ?>
+                                        <form class="inline-form" method="post" action="player.php">
+                                            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                            <input type="hidden" name="action" value="special_approve">
+                                            <input type="hidden" name="id" value="<?= (int) $item['id'] ?>">
+                                            <button class="btn btn-primary btn-sm" type="submit">通过</button>
+                                        </form>
+                                    <?php endif; ?>
+
+                                    <?php if ($status !== 'rejected'): ?>
+                                        <form class="inline-form special-reject-form" method="post" action="player.php">
+                                            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                            <input type="hidden" name="action" value="special_reject">
+                                            <input type="hidden" name="id" value="<?= (int) $item['id'] ?>">
+                                            <input class="input input-sm" type="text" name="reject_reason"
+                                                   placeholder="拒绝原因" maxlength="200">
+                                            <button class="btn btn-secondary btn-sm" type="submit">拒绝</button>
+                                        </form>
+                                    <?php endif; ?>
+
+                                    <form class="inline-form" method="post" action="player.php"
+                                          onsubmit="return confirm('确定删除这条特殊播音记录吗？');">
+                                        <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                        <input type="hidden" name="action" value="special_delete">
+                                        <input type="hidden" name="id" value="<?= (int) $item['id'] ?>">
+                                        <button class="btn btn-danger btn-sm" type="submit">删除</button>
+                                    </form>
+                                </div>
+                            </article>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+
+                <div class="review-actions">
+                    <button class="btn btn-primary" id="specialContinueBtn" type="button">继续歌曲审核</button>
+                </div>
+            </section>
+
             <section id="reviewLogin">
                 <p class="review-intro">有新的歌曲需要审核</p>
                 <div class="form-row">
@@ -284,6 +467,7 @@ $completedCount = $approvedCount - $activeCount;
                 <p class="review-hint">请完整试听后再作出审核结论。若视频未自动播放，请点击画面中的播放按钮。</p>
                 <p class="form-error" id="reviewError" hidden></p>
                 <div class="review-actions">
+                    <button class="btn btn-secondary" id="reviewSkipSongBtn" type="button">跳过这首</button>
                     <button class="btn btn-danger" id="reviewRejectBtn" type="button">拒绝</button>
                     <button class="btn btn-success" id="reviewApproveBtn" type="button">通过</button>
                 </div>
@@ -309,7 +493,8 @@ $completedCount = $approvedCount - $activeCount;
 window.PLAYLIST = <?= $playlistJson ?>;
 window.PENDING_LIST = <?= $pendingJson ?>;
 window.CSRF_TOKEN = <?= $csrfTokenJson ?>;
+window.SPECIAL_PENDING = <?= (int) $specialCounts['pending'] ?>;
+window.REVIEW_OPEN = <?= $reviewOpen ? 'true' : 'false' ?>;
 </script>
-<script src="assets/js/player.js?v=8"></script>
-</body>
-</html>
+<script src="assets/js/player.js?v=9"></script>
+<?php require __DIR__ . '/includes/footer.php'; ?>

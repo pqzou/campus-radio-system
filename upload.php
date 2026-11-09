@@ -17,9 +17,36 @@ function normalize_class_name(string $value): string
     return $normalized === null ? $value : $normalized;
 }
 
-function upload_redirect(string $className): void
+function normalize_song_tab(string $value): string
 {
-    redirect('upload.php' . ($className !== '' ? '?class=' . rawurlencode($className) : ''));
+    return in_array($value, ['pending', 'approved', 'rejected', 'completed'], true)
+        ? $value
+        : 'pending';
+}
+
+function song_status_group(string $status): string
+{
+    if ($status === STATUS_REJECTED) {
+        return 'rejected';
+    }
+    if ($status === STATUS_APPROVED) {
+        return 'approved';
+    }
+
+    return 'pending';
+}
+
+function upload_redirect(string $className, string $tab = ''): void
+{
+    $params = [];
+    if ($className !== '') {
+        $params['class'] = $className;
+    }
+    if ($tab !== '') {
+        $params['tab'] = $tab;
+    }
+
+    redirect('upload.php' . ($params ? '?' . http_build_query($params) : ''));
 }
 
 /**
@@ -196,10 +223,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $action      = (string) ($_POST['action'] ?? '');
     $postedClass = normalize_class_name((string) ($_POST['class_name'] ?? ''));
+    $postedTab   = normalize_song_tab((string) ($_POST['tab'] ?? 'pending'));
 
     if (!$uploadOpen) {
         flash('error', '当前点播通道已关闭，暂时无法提交或修改节目。');
-        upload_redirect($postedClass);
+        upload_redirect($postedClass, $postedTab);
     }
 
     try {
@@ -211,9 +239,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $errors = array_merge($errors, $rowErrors);
 
             if ($className === '') {
-                $errors[] = '请填写班级名称。';
-            } elseif (text_length($className) > 50) {
-                $errors[] = '班级名称不能超过 50 个字符。';
+                $errors[] = '请选择班级。';
+            } elseif (find_class_record($db, $className) === null) {
+                $errors[] = '所选班级不存在，请从班级列表中选择。';
             }
 
             if (!$rows && !$rowErrors) {
@@ -231,7 +259,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 foreach ($errors as $error) {
                     flash('error', $error);
                 }
-                upload_redirect($className);
+                upload_redirect($className, $postedTab);
             }
 
             // 先完成视频匹配，避免在数据库事务中执行网络请求。
@@ -281,13 +309,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $submitted = count($rows);
+            $titlePreview = [];
+            foreach (array_slice($rows, 0, 5) as $row) {
+                $titlePreview[] = $row['title'];
+            }
+            audit_log(
+                'add',
+                'song',
+                '歌曲',
+                '',
+                "班级「{$className}」提交 {$submitted} 首：" . implode('、', $titlePreview),
+                $uploader['name'] . '（' . $uploader['no'] . '）',
+                'student'
+            );
             flash(
                 'success',
                 $submitted === 1
                     ? "《{$rows[0]['title']}》已提交，等待审核。"
                     : "已提交 {$submitted} 首曲目，等待审核。"
             );
-            upload_redirect($className);
+            upload_redirect($className, 'pending');
         }
 
         if ($action === 'update') {
@@ -296,14 +337,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if ($song === null) {
                 flash('error', '未找到该曲目，可能已被删除。');
-                upload_redirect($postedClass);
+                upload_redirect($postedClass, $postedTab);
             }
 
             $className = (string) $song['class_name'];
 
             if ($song['completed_at'] !== null) {
-                flash('error', '该曲目已归档到已完成历史，不能在这里修改。');
-                upload_redirect($className);
+                flash('error', '该曲目已归档到点歌历史，不能在这里修改。');
+                upload_redirect($className, $postedTab);
             }
 
             [$fields, $errors] = parse_song_fields();
@@ -312,7 +353,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 foreach ($errors as $error) {
                     flash('error', $error);
                 }
-                redirect('upload.php?class=' . rawurlencode($className) . '&edit=' . $songId . '#edit-song');
+                redirect(
+                    'upload.php?class=' . rawurlencode($className)
+                    . '&tab=' . rawurlencode($postedTab)
+                    . '&edit=' . $songId . '#edit-song'
+                );
             }
 
             $total       = count_active_class_songs($db, $className);
@@ -325,15 +370,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 || $fields['artist'] !== (string) $song['artist'];
 
             $contentChanged = $identityChanged
-                || $fields['remark'] !== (string) $song['remark']
-                || $position !== $currentPos;
+                || $fields['remark'] !== (string) $song['remark'];
+
+            $positionChanged = $position !== $currentPos;
 
             $uploaderChanged = $fields['uploader_name'] !== (string) $song['uploader_name']
                 || $fields['uploader_no'] !== (string) $song['uploader_no'];
 
-            if (!$contentChanged && !$uploaderChanged) {
+            if (!$contentChanged && !$uploaderChanged && !$positionChanged) {
                 flash('info', '未检测到内容变化，曲目状态保持不变。');
-                upload_redirect($className);
+                upload_redirect($className, $postedTab);
             }
 
             $bvid         = $song['bvid'] !== null ? (string) $song['bvid'] : null;
@@ -387,9 +433,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
             }
 
-            if ($contentChanged && $position !== $currentPos) {
+            if ($positionChanged) {
                 reorder_active_song($db, $className, $songId, $position);
             }
+
+            audit_log(
+                'update',
+                'song',
+                '歌曲',
+                $songId,
+                "修改曲目《{$fields['title']}》（班级 {$className}）"
+                    . ($contentChanged ? '，需重新审核' : ($positionChanged ? '，调整播放顺序' : '')),
+                $fields['uploader_name'] . '（' . $fields['uploader_no'] . '）',
+                'student'
+            );
 
             if ($contentChanged) {
                 if (in_array((string) $song['status'], [STATUS_APPROVED, STATUS_RE_REVIEW], true)) {
@@ -399,10 +456,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 } else {
                     flash('success', '修改已保存，曲目仍在等待审核。');
                 }
+            } elseif ($positionChanged) {
+                flash('success', '播放顺序已调整，审核状态保持不变。');
             } else {
                 flash('success', '上传人信息已更新，曲目审核状态保持不变。');
             }
-            upload_redirect($className);
+            upload_redirect($className, $contentChanged ? 'pending' : $postedTab);
         }
 
         if ($action === 'delete') {
@@ -411,22 +470,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if ($song === null) {
                 flash('error', '未找到该曲目，可能已被删除。');
-                upload_redirect($postedClass);
+                upload_redirect($postedClass, $postedTab);
             }
 
             $className = (string) $song['class_name'];
 
             if ($song['completed_at'] !== null) {
                 flash('error', '已完成曲目已归档到历史记录，不能从历史中删除。');
-                upload_redirect($className);
+                upload_redirect($className, $postedTab);
             }
 
             $stmt = $db->prepare('DELETE FROM `songs` WHERE `id` = ?');
             $stmt->execute([$songId]);
             normalize_active_class_orders($db, $className);
 
-            flash('success', "《{$song['title']}》已从节目单中删除。");
-            upload_redirect($className);
+            audit_log(
+                'delete',
+                'song',
+                '歌曲',
+                $songId,
+                "删除曲目《{$song['title']}》（班级 {$className}）",
+                $className,
+                'student'
+            );
+
+            flash('success', "《{$song['title']}》已从播放清单中删除。");
+            upload_redirect($className, $postedTab);
         }
 
         if ($action === 'move') {
@@ -436,58 +505,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if ($song === null) {
                 flash('error', '未找到该曲目，可能已被删除。');
-                upload_redirect($postedClass);
+                upload_redirect($postedClass, $postedTab);
             }
 
             $className = (string) $song['class_name'];
 
             if ($song['completed_at'] !== null) {
                 flash('error', '已完成曲目已归档到历史记录，不能调整播放顺序。');
-                upload_redirect($className);
+                upload_redirect($className, $postedTab);
             }
 
-            $ids       = active_class_song_ids($db, $className);
-            $index     = array_search($songId, $ids, true);
+            $group = song_status_group((string) $song['status']);
+            $stmt  = $db->prepare(
+                'SELECT `id`, `sort_order`, `status` FROM `songs`
+                 WHERE `class_name` = ? AND `completed_at` IS NULL
+                 ORDER BY `sort_order` ASC, `id` ASC'
+            );
+            $stmt->execute([$className]);
+
+            $peers = [];
+            foreach ($stmt->fetchAll() as $row) {
+                if (song_status_group((string) $row['status']) !== $group) {
+                    continue;
+                }
+                $peers[] = [
+                    'id'         => (int) $row['id'],
+                    'sort_order' => (int) $row['sort_order'],
+                ];
+            }
+
+            $index = false;
+            foreach ($peers as $peerIndex => $peer) {
+                if ($peer['id'] === $songId) {
+                    $index = $peerIndex;
+                    break;
+                }
+            }
 
             if ($index === false || !in_array($direction, ['up', 'down'], true)) {
                 flash('error', '无法调整该曲目的顺序。');
-                upload_redirect($className);
+                upload_redirect($className, $postedTab);
             }
 
             $targetIndex = $direction === 'up' ? $index - 1 : $index + 1;
-            if ($targetIndex < 0 || $targetIndex >= count($ids)) {
+            if ($targetIndex < 0 || $targetIndex >= count($peers)) {
                 flash('info', '已经到达播放顺序的边界。');
-                upload_redirect($className);
+                upload_redirect($className, $postedTab);
             }
 
-            reorder_active_song($db, $className, $songId, $targetIndex + 1);
+            $current = $peers[$index];
+            $target  = $peers[$targetIndex];
 
-            $needsReview = in_array((string) $song['status'], [STATUS_APPROVED, STATUS_RE_REVIEW], true);
-            if ($needsReview) {
-                $reset = $db->prepare(
-                    'UPDATE `songs`
-                     SET `status` = ?, `reviewer_name` = NULL, `reviewer_no` = NULL, `reviewed_at` = NULL,
-                         `completed_at` = NULL, `progress_seconds` = 0, `updated_at` = NOW()
-                     WHERE `id` = ?'
-                );
-                $reset->execute([STATUS_RE_REVIEW, $songId]);
+            if ($current['sort_order'] !== $target['sort_order']) {
+                $swap = $db->prepare('UPDATE `songs` SET `sort_order` = ? WHERE `id` = ?');
+                $swap->execute([$target['sort_order'], $current['id']]);
+                $swap->execute([$current['sort_order'], $target['id']]);
             }
 
-            flash(
-                'success',
-                $needsReview
-                    ? '播放顺序已调整。该曲目已打回“待重新审核”。'
-                    : '播放顺序已调整。'
+            audit_log(
+                'move',
+                'song',
+                '歌曲',
+                $songId,
+                "调整曲目《{$song['title']}》播放顺序（班级 {$className}）",
+                $className,
+                'student'
             );
-            upload_redirect($className);
+
+            flash('success', '播放顺序已调整，审核状态保持不变。');
+            upload_redirect($className, $postedTab);
         }
 
         flash('error', '未知操作。');
-        upload_redirect($postedClass);
+        upload_redirect($postedClass, $postedTab);
     } catch (Throwable $e) {
         error_log('upload.php error: ' . $e->getMessage());
         flash('error', '操作失败，请稍后重试。');
-        upload_redirect($postedClass);
+        upload_redirect($postedClass, $postedTab);
     }
 }
 
@@ -495,15 +589,53 @@ $className = normalize_class_name((string) ($_GET['class'] ?? ''));
 if (text_length($className) > 50) {
     $className = '';
 }
+$tab = normalize_song_tab((string) ($_GET['tab'] ?? 'pending'));
 
-$classes = $db->query(
+$classRecord = $className !== '' ? find_class_record($db, $className) : null;
+if ($classRecord === null) {
+    $className = '';
+}
+
+$majors = get_majors_with_classes($db);
+
+$statsRows = $db->query(
     "SELECT `class_name`,
             SUM(CASE WHEN `completed_at` IS NULL AND `status` = 'approved' THEN 1 ELSE 0 END) AS `song_count`,
             SUM(CASE WHEN `completed_at` IS NOT NULL THEN 1 ELSE 0 END) AS `completed_count`
      FROM `songs`
-     GROUP BY `class_name`
-     ORDER BY `class_name` ASC"
+     GROUP BY `class_name`"
 )->fetchAll();
+
+$classStats = [];
+foreach ($statsRows as $statsRow) {
+    $classStats[(string) $statsRow['class_name']] = [
+        'song_count'      => (int) $statsRow['song_count'],
+        'completed_count' => (int) $statsRow['completed_count'],
+    ];
+}
+
+$hasClasses      = false;
+$classGroupsData = [];
+foreach ($majors as $major) {
+    $majorClasses = [];
+    foreach ($major['classes'] as $item) {
+        $majorClasses[] = ['name' => $item['name']];
+        $hasClasses     = true;
+    }
+    $classGroupsData[] = [
+        'id'      => $major['id'],
+        'name'    => $major['name'],
+        'classes' => $majorClasses,
+    ];
+}
+
+if ($classRecord !== null) {
+    $selectedMajorId = (int) $classRecord['major_id'];
+} elseif ($majors) {
+    $selectedMajorId = (int) $majors[0]['id'];
+} else {
+    $selectedMajorId = 0;
+}
 
 $activeSongs    = [];
 $completedSongs = [];
@@ -548,26 +680,45 @@ if ($className !== '') {
 }
 
 $songCount     = count($activeSongs);
-$completedCount = count($completedSongs);
+
+$pendingSongs  = [];
+$approvedSongs = [];
+$rejectedSongs = [];
 
 $playableCount = 0;
 $quotaCount    = 0;
 foreach ($activeSongs as $activeSong) {
     $activeStatus = (string) $activeSong['status'];
     if ($activeStatus === STATUS_APPROVED) {
+        $approvedSongs[] = $activeSong;
         $playableCount++;
+    } elseif ($activeStatus === STATUS_REJECTED) {
+        $rejectedSongs[] = $activeSong;
+    } else {
+        $pendingSongs[] = $activeSong;
     }
     if ($activeStatus !== STATUS_REJECTED) {
         $quotaCount++;
     }
 }
 
-$canAdd        = $uploadOpen && $quotaCount < $maxPerClass;
-$remaining     = max(0, $maxPerClass - $quotaCount);
-$reviewCount   = $quotaCount - $playableCount;
-$rejectedCount = $songCount - $quotaCount;
-$editingPos    = $editSong !== null ? active_song_position($db, $className, (int) $editSong['id']) : 0;
-$verifiedCount = (int) $db->query('SELECT COUNT(*) FROM `verified_uploaders`')->fetchColumn();
+$tabSongs = $pendingSongs;
+if ($tab === 'approved') {
+    $tabSongs = $approvedSongs;
+} elseif ($tab === 'rejected') {
+    $tabSongs = $rejectedSongs;
+} elseif ($tab === 'completed') {
+    $tabSongs = $completedSongs;
+}
+
+$canAdd         = $uploadOpen && $quotaCount < $maxPerClass;
+$remaining      = max(0, $maxPerClass - $quotaCount);
+$reviewCount    = count($pendingSongs);
+$rejectedCount  = count($rejectedSongs);
+$completedCount = count($completedSongs);
+$tabSongCount   = count($tabSongs);
+$editingPos     = $editSong !== null ? active_song_position($db, $className, (int) $editSong['id']) : 0;
+$verifiedCount  = (int) $db->query('SELECT COUNT(*) FROM `verified_uploaders`')->fetchColumn();
 
 $pageTitle = '班级上传';
 $activeNav = 'upload';
@@ -590,44 +741,85 @@ require __DIR__ . '/includes/header.php';
 
 <section class="panel">
     <div class="panel-head">
-        <h2>选择班级</h2>
+        <h2>选择专业与班级</h2>
     </div>
     <div class="panel-body">
-        <form class="class-selector" method="get" action="upload.php">
-            <input class="input" type="text" name="class" list="class-options"
-                   placeholder="请输入班级名称" maxlength="50" autocomplete="off" required>
-            <datalist id="class-options">
-                <?php foreach ($classes as $item): ?>
-                    <option value="<?= h($item['class_name']) ?>"></option>
-                <?php endforeach; ?>
-            </datalist>
-            <button type="submit" class="btn btn-primary">进入节目单</button>
-        </form>
+        <?php if (!$hasClasses): ?>
+            <div class="notice notice-warn">
+                <strong>暂无可选班级</strong>
+                <span>管理员还没有在“系统设置”中添加专业和班级，请先联系广播室。</span>
+            </div>
+        <?php else: ?>
+            <form class="class-selector" method="get" action="upload.php" id="classSelector">
+                <select class="input class-select" id="majorSelect" aria-label="选择专业">
+                    <?php foreach ($majors as $major): ?>
+                        <option value="<?= (int) $major['id'] ?>"
+                            <?= (int) $major['id'] === $selectedMajorId ? 'selected' : '' ?>>
+                            <?= h($major['name']) ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+                <select class="input class-select" id="classSelect" name="class"
+                        data-current="<?= h($className) ?>" aria-label="选择班级" required>
+                    <?php foreach ($majors as $major): ?>
+                        <?php if (!$major['classes']) { continue; } ?>
+                        <optgroup label="<?= h($major['name']) ?>">
+                            <?php foreach ($major['classes'] as $item): ?>
+                                <option value="<?= h($item['name']) ?>"
+                                    <?= $item['name'] === $className ? 'selected' : '' ?>>
+                                    <?= h($item['name']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </optgroup>
+                    <?php endforeach; ?>
+                </select>
+                <button type="submit" class="btn btn-primary">进入节目单</button>
+            </form>
 
-        <?php if ($classes): ?>
-            <div class="class-chips" aria-label="已有班级">
-                <?php foreach ($classes as $item): ?>
-                    <a class="chip <?= $className === $item['class_name'] ? 'is-active' : '' ?>"
-                       href="upload.php?class=<?= h(rawurlencode($item['class_name'])) ?>">
-                        <?= h($item['class_name']) ?>
-                        <span><?= h((string) $item['song_count']) ?> 首待播</span>
-                        <?php if ((int) $item['completed_count'] > 0): ?>
-                            <span class="chip-history">历史 <?= h((string) $item['completed_count']) ?></span>
-                        <?php endif; ?>
-                    </a>
+            <div class="class-groups" aria-label="已有班级">
+                <?php foreach ($majors as $major): ?>
+                    <?php if (!$major['classes']) { continue; } ?>
+                    <div class="class-group">
+                        <p class="class-group-title"><?= h($major['name']) ?></p>
+                        <div class="class-chips">
+                            <?php foreach ($major['classes'] as $item): ?>
+                                <?php
+                                $itemStats = $classStats[$item['name']] ?? [
+                                    'song_count'      => 0,
+                                    'completed_count' => 0,
+                                ];
+                                ?>
+                                <a class="chip <?= $className === $item['name'] ? 'is-active' : '' ?>"
+                                   href="upload.php?class=<?= h(rawurlencode($item['name'])) ?>">
+                                    <?= h($item['name']) ?>
+                                    <span><?= h((string) $itemStats['song_count']) ?> 首待播</span>
+                                    <?php if ($itemStats['completed_count'] > 0): ?>
+                                        <span class="chip-history">历史 <?= h((string) $itemStats['completed_count']) ?></span>
+                                    <?php endif; ?>
+                                </a>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
                 <?php endforeach; ?>
             </div>
         <?php endif; ?>
     </div>
 </section>
 
+<script>
+window.__CLASS_GROUPS__ = <?= json_encode(
+    $classGroupsData,
+    JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
+) ?>;
+</script>
+
 <?php if ($className !== ''): ?>
     <div class="upload-layout">
         <section class="panel programme-panel">
             <div class="panel-head panel-head-row">
                 <div>
-                    <h2><?= h($className) ?> · 当前节目单</h2>
-                    <p>待播放 <?= h((string) $playableCount) ?> 首<?php if ($reviewCount > 0): ?>，待审核 <?= h((string) $reviewCount) ?> 首<?php endif; ?><?php if ($rejectedCount > 0): ?>，未通过 <?= h((string) $rejectedCount) ?> 首<?php endif; ?>，单班上限 <?= h((string) $maxPerClass) ?> 首。</p>
+                    <h2><?= h($className) ?></h2>
+                    <p>待播放 <?= h((string) $playableCount) ?> 首<?php if ($reviewCount > 0): ?>，待审核 <?= h((string) $reviewCount) ?> 首<?php endif; ?><?php if ($rejectedCount > 0): ?>，拒绝 <?= h((string) $rejectedCount) ?> 首<?php endif; ?>，单班上限 <?= h((string) $maxPerClass) ?> 首。</p>
                 </div>
                 <span class="badge <?= $quotaCount >= $maxPerClass ? 'badge-pending' : 'badge-approved' ?>">
                     <?= h((string) $playableCount) ?> 首待播
@@ -635,35 +827,58 @@ require __DIR__ . '/includes/header.php';
             </div>
 
             <div class="panel-body">
-                <?php if (!$activeSongs): ?>
+                <?php
+                $tabItems = [
+                    'pending'   => ['label' => '待审核', 'count' => $reviewCount],
+                    'approved'  => ['label' => '审核通过', 'count' => $playableCount],
+                    'rejected'  => ['label' => '拒绝', 'count' => $rejectedCount],
+                    'completed' => ['label' => '播放完毕', 'count' => $completedCount],
+                ];
+                $emptyText = [
+                    'pending'   => '暂无待审核曲目',
+                    'approved'  => '暂无审核通过的曲目',
+                    'rejected'  => '暂无被拒绝的曲目',
+                    'completed' => '暂无点歌历史',
+                ][$tab] ?? '暂无曲目';
+                ?>
+                <nav class="song-tabs" aria-label="曲目分类">
+                    <?php foreach ($tabItems as $tabKey => $tabItem): ?>
+                        <a class="song-tab <?= $tab === $tabKey ? 'is-active' : '' ?>"
+                           href="upload.php?<?= h(http_build_query(['class' => $className, 'tab' => $tabKey])) ?>">
+                            <?= h($tabItem['label']) ?><span class="song-tab-count"><?= h((string) $tabItem['count']) ?></span>
+                        </a>
+                    <?php endforeach; ?>
+                </nav>
+
+                <?php if (!$tabSongs): ?>
                     <div class="empty-state">
-                        <h3>本班暂无待播放曲目</h3>
-                        <?php if ($completedSongs): ?>
-                            <p>已完成的曲目已归入下方历史记录，可在提交表单中继续添加新曲目。</p>
-                        <?php else: ?>
-                            <p>请在提交表单中填写上传人信息并添加歌曲。</p>
-                        <?php endif; ?>
+                        <h3><?= h($emptyText) ?></h3>
                     </div>
                 <?php else: ?>
                     <div class="song-list">
-                        <?php foreach ($activeSongs as $index => $song): ?>
+                        <?php foreach ($tabSongs as $index => $song): ?>
                             <?php
-                            $songId     = (int) $song['id'];
-                            $status     = (string) $song['status'];
-                            $isApproved = $status === STATUS_APPROVED;
-                            $isReReview = $status === STATUS_RE_REVIEW;
-                            $isRejected = $status === STATUS_REJECTED;
-                            $bvid       = !empty($song['bvid']) ? (string) $song['bvid'] : '';
+                            $songId      = (int) $song['id'];
+                            $status      = (string) $song['status'];
+                            $isCompleted = $song['completed_at'] !== null;
+                            $isReReview  = $status === STATUS_RE_REVIEW;
+                            $isRejected  = $status === STATUS_REJECTED;
+                            $bvid        = !empty($song['bvid']) ? (string) $song['bvid'] : '';
+                            $canMove     = !$isCompleted && $tab !== 'rejected';
                             ?>
-                            <article class="song-item" id="song-<?= $songId ?>">
+                            <article class="song-item <?= $isCompleted ? 'is-history' : '' ?>" id="song-<?= $songId ?>">
                                 <div class="song-index"><?= h(str_pad((string) ($index + 1), 2, '0', STR_PAD_LEFT)) ?></div>
                                 <div class="song-main">
                                     <div class="song-title-line">
                                         <h3>《<?= h($song['title']) ?>》</h3>
-                                        <span class="badge <?= h(status_class($status)) ?>"><?= h(status_label($status)) ?></span>
+                                        <?php if (!$isCompleted): ?>
+                                            <span class="badge <?= h(status_class($status)) ?>"><?= h(status_label($status)) ?></span>
+                                        <?php endif; ?>
                                     </div>
                                     <p class="song-meta">
-                                        <span>第 <?= h((string) ($index + 1)) ?> 首</span>
+                                        <?php if (!$isCompleted): ?>
+                                            <span>第 <?= h((string) ($index + 1)) ?> 首</span>
+                                        <?php endif; ?>
                                         <span>作者：<?= h($song['artist'] !== '' ? $song['artist'] : '未填写') ?></span>
                                         <span>上传人：<?= h($song['uploader_name'] !== '' ? $song['uploader_name'] : '未填写') ?>
                                             （<?= h($song['uploader_no'] !== '' ? $song['uploader_no'] : '未填写') ?>）</span>
@@ -673,67 +888,78 @@ require __DIR__ . '/includes/header.php';
                                         <?php else: ?>
                                             <span class="text-warn">待审核补充播放链接</span>
                                         <?php endif; ?>
-                                        <span>提交于 <?= h(substr((string) $song['created_at'], 0, 16)) ?></span>
+                                        <?php if ($isCompleted): ?>
+                                            <span>完成于 <?= h(substr((string) $song['completed_at'], 0, 16)) ?></span>
+                                        <?php else: ?>
+                                            <span>提交于 <?= h(substr((string) $song['created_at'], 0, 16)) ?></span>
+                                        <?php endif; ?>
                                     </p>
                                     <?php if ($song['remark'] !== ''): ?>
                                         <p class="song-remark"><span>广播备注</span><?= h($song['remark']) ?></p>
                                     <?php endif; ?>
-                                    <?php if ($isApproved && $song['reviewer_name']): ?>
+                                    <?php if (!$isCompleted && $isReReview): ?>
+                                        <p class="song-reviewer is-warn">内容已修改，原审核信息已清空，等待广播室重新审核。</p>
+                                    <?php elseif (!$isCompleted && $isRejected): ?>
+                                        <p class="song-reviewer is-danger">
+                                            <?php if (!empty($song['reject_reason'])): ?>
+                                                拒绝原因：<?= h($song['reject_reason']) ?>。请修改内容后重新提交。
+                                            <?php else: ?>
+                                                该曲目已被拒绝，请修改内容后重新提交。
+                                            <?php endif; ?>
+                                        </p>
+                                    <?php elseif ($song['reviewer_name']): ?>
                                         <p class="song-reviewer">
                                             审核人：<?= h($song['reviewer_name']) ?>
                                             （<?= h($song['reviewer_no']) ?>）
                                             · <?= h(substr((string) $song['reviewed_at'], 0, 16)) ?>
                                         </p>
-                                    <?php elseif ($isReReview): ?>
-                                        <p class="song-reviewer is-warn">内容已修改，原审核信息已清空，等待广播室重新审核。</p>
-                                    <?php elseif ($isRejected): ?>
-                                        <p class="song-reviewer is-danger">
-                                            <?php if (!empty($song['reject_reason'])): ?>
-                                                未通过审核：<?= h($song['reject_reason']) ?>。请修改内容后重新提交。
-                                            <?php else: ?>
-                                                该曲目未通过审核，请修改内容后重新提交。
+                                    <?php endif; ?>
+                                </div>
+                                <?php if (!$isCompleted): ?>
+                                    <div class="song-side">
+                                        <?php if ($uploadOpen): ?>
+                                            <?php if ($canMove): ?>
+                                                <div class="order-tools" aria-label="调整顺序">
+                                                    <form method="post" action="upload.php">
+                                                        <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                                        <input type="hidden" name="action" value="move">
+                                                        <input type="hidden" name="id" value="<?= $songId ?>">
+                                                        <input type="hidden" name="class_name" value="<?= h($className) ?>">
+                                                        <input type="hidden" name="tab" value="<?= h($tab) ?>">
+                                                        <input type="hidden" name="direction" value="up">
+                                                        <button class="icon-btn" type="submit" title="上移"
+                                                                <?= $index === 0 ? 'disabled' : '' ?>>↑</button>
+                                                    </form>
+                                                    <form method="post" action="upload.php">
+                                                        <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                                        <input type="hidden" name="action" value="move">
+                                                        <input type="hidden" name="id" value="<?= $songId ?>">
+                                                        <input type="hidden" name="class_name" value="<?= h($className) ?>">
+                                                        <input type="hidden" name="tab" value="<?= h($tab) ?>">
+                                                        <input type="hidden" name="direction" value="down">
+                                                        <button class="icon-btn" type="submit" title="下移"
+                                                                <?= $index === $tabSongCount - 1 ? 'disabled' : '' ?>>↓</button>
+                                                    </form>
+                                                </div>
                                             <?php endif; ?>
-                                        </p>
-                                    <?php endif; ?>
-                                </div>
-                                <div class="song-side">
-                                    <?php if ($uploadOpen): ?>
-                                        <div class="order-tools" aria-label="调整顺序">
-                                            <form method="post" action="upload.php">
-                                                <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
-                                                <input type="hidden" name="action" value="move">
-                                                <input type="hidden" name="id" value="<?= $songId ?>">
-                                                <input type="hidden" name="class_name" value="<?= h($className) ?>">
-                                                <input type="hidden" name="direction" value="up">
-                                                <button class="icon-btn" type="submit" title="上移"
-                                                        <?= $index === 0 ? 'disabled' : '' ?>>↑</button>
-                                            </form>
-                                            <form method="post" action="upload.php">
-                                                <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
-                                                <input type="hidden" name="action" value="move">
-                                                <input type="hidden" name="id" value="<?= $songId ?>">
-                                                <input type="hidden" name="class_name" value="<?= h($className) ?>">
-                                                <input type="hidden" name="direction" value="down">
-                                                <button class="icon-btn" type="submit" title="下移"
-                                                        <?= $index === $songCount - 1 ? 'disabled' : '' ?>>↓</button>
-                                            </form>
-                                        </div>
-                                        <div class="song-actions">
-                                            <a class="btn btn-secondary btn-sm"
-                                               href="upload.php?class=<?= h(rawurlencode($className)) ?>&amp;edit=<?= $songId ?>#edit-song">修改</a>
-                                            <form method="post" action="upload.php"
-                                                  onsubmit="return confirm('确定要从节目单中删除这首曲目吗？');">
-                                                <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
-                                                <input type="hidden" name="action" value="delete">
-                                                <input type="hidden" name="id" value="<?= $songId ?>">
-                                                <input type="hidden" name="class_name" value="<?= h($className) ?>">
-                                                <button class="btn btn-danger btn-sm" type="submit">删除</button>
-                                            </form>
-                                        </div>
-                                    <?php else: ?>
-                                        <span class="muted">通道关闭，暂不可调整</span>
-                                    <?php endif; ?>
-                                </div>
+                                            <div class="song-actions">
+                                                <a class="btn btn-secondary btn-sm"
+                                                   href="upload.php?class=<?= h(rawurlencode($className)) ?>&amp;tab=<?= h(rawurlencode($tab)) ?>&amp;edit=<?= $songId ?>#edit-song">修改</a>
+                                                <form method="post" action="upload.php"
+                                                      onsubmit="return confirm('确定要删除这首曲目吗？');">
+                                                    <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                                    <input type="hidden" name="action" value="delete">
+                                                    <input type="hidden" name="id" value="<?= $songId ?>">
+                                                    <input type="hidden" name="class_name" value="<?= h($className) ?>">
+                                                    <input type="hidden" name="tab" value="<?= h($tab) ?>">
+                                                    <button class="btn btn-danger btn-sm" type="submit">删除</button>
+                                                </form>
+                                            </div>
+                                        <?php else: ?>
+                                            <span class="muted">通道关闭，暂不可调整</span>
+                                        <?php endif; ?>
+                                    </div>
+                                <?php endif; ?>
                             </article>
                         <?php endforeach; ?>
                     </div>
@@ -763,6 +989,7 @@ require __DIR__ . '/includes/header.php';
                     <input type="hidden" name="action" value="update">
                     <input type="hidden" name="id" value="<?= (int) $editSong['id'] ?>">
                     <input type="hidden" name="class_name" value="<?= h($className) ?>">
+                    <input type="hidden" name="tab" value="<?= h($tab) ?>">
 
                     <?php if ((string) $editSong['status'] === STATUS_REJECTED && !empty($editSong['reject_reason'])): ?>
                         <p class="form-error">上次拒绝原因：<?= h($editSong['reject_reason']) ?></p>
@@ -824,13 +1051,13 @@ require __DIR__ . '/includes/header.php';
 
                     <div class="form-actions">
                         <button class="btn btn-primary" type="submit">保存修改</button>
-                        <a class="btn btn-secondary" href="upload.php?class=<?= h(rawurlencode($className)) ?>">取消</a>
+                        <a class="btn btn-secondary" href="upload.php?class=<?= h(rawurlencode($className)) ?>&amp;tab=<?= h(rawurlencode($tab)) ?>">取消</a>
                     </div>
                 </form>
             <?php elseif (!$canAdd): ?>
                 <div class="panel-head">
-                    <h2>当前节目单已满</h2>
-                    <p>本班节目单占用名额已达上限（<?= h((string) $maxPerClass) ?> 首）。可先删除当前曲目，或等待已有曲目完成后归入历史。</p>
+                    <h2>播放清单已满</h2>
+                    <p>本班播放清单占用名额已达上限（<?= h((string) $maxPerClass) ?> 首）。可先删除当前曲目，或等待已有曲目完成后归入历史。</p>
                 </div>
             <?php else: ?>
                 <div class="panel-head">
@@ -841,6 +1068,7 @@ require __DIR__ . '/includes/header.php';
                     <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
                     <input type="hidden" name="action" value="batch_add">
                     <input type="hidden" name="class_name" value="<?= h($className) ?>">
+                    <input type="hidden" name="tab" value="<?= h($tab) ?>">
 
                     <?php if ($verifiedCount === 0): ?>
                         <div class="notice notice-warn">
@@ -918,70 +1146,16 @@ require __DIR__ . '/includes/header.php';
                     <div class="form-actions">
                         <button class="btn btn-primary btn-block" type="submit" id="batchSubmitBtn">提交全部歌曲</button>
                     </div>
-                    <p class="form-note">
-                        提交后由广播室统一审核；请在填写完成后通知广播室成员。
-                    </p>
                 </form>
             <?php endif; ?>
         </aside>
     </div>
 
-    <?php if ($completedSongs): ?>
-        <section class="panel class-history-panel">
-            <div class="panel-head panel-head-row">
-                <div>
-                    <h2><?= h($className) ?> · 已完成历史</h2>
-                    <p>已标记完成的曲目会归档到这里。</p>
-                </div>
-                <span class="badge badge-approved"><?= h((string) $completedCount) ?> 首</span>
-            </div>
-            <div class="panel-body">
-                <div class="song-list">
-                    <?php foreach ($completedSongs as $index => $song): ?>
-                        <?php $historyBvid = !empty($song['bvid']) ? (string) $song['bvid'] : ''; ?>
-                        <article class="song-item is-history">
-                            <div class="song-index"><?= h(str_pad((string) ($index + 1), 2, '0', STR_PAD_LEFT)) ?></div>
-                            <div class="song-main">
-                                <div class="song-title-line">
-                                    <h3>《<?= h($song['title']) ?>》</h3>
-                                </div>
-                                <p class="song-meta">
-                                    <span>作者：<?= h($song['artist'] !== '' ? $song['artist'] : '未填写') ?></span>
-                                    <span>上传人：<?= h($song['uploader_name'] !== '' ? $song['uploader_name'] : '未填写') ?>
-                                        （<?= h($song['uploader_no'] !== '' ? $song['uploader_no'] : '未填写') ?>）</span>
-                                    <?php if ($historyBvid !== ''): ?>
-                                        <a href="https://www.bilibili.com/video/<?= h($historyBvid) ?>"
-                                           target="_blank" rel="noopener"><?= h($historyBvid) ?></a>
-                                    <?php else: ?>
-                                        <span class="text-warn">待审核补充播放链接</span>
-                                    <?php endif; ?>
-                                    <span>完成于 <?= h(substr((string) $song['completed_at'], 0, 16)) ?></span>
-                                </p>
-                                <?php if ($song['remark'] !== ''): ?>
-                                    <p class="song-remark"><span>广播备注</span><?= h($song['remark']) ?></p>
-                                <?php endif; ?>
-                                <?php if ($song['reviewer_name']): ?>
-                                    <p class="song-reviewer">
-                                        审核人：<?= h($song['reviewer_name']) ?>
-                                        （<?= h($song['reviewer_no']) ?>）
-                                        · <?= h(substr((string) $song['reviewed_at'], 0, 16)) ?>
-                                    </p>
-                                <?php endif; ?>
-                            </div>
-                            <div class="song-side">
-                                <span class="tag-done">已完成</span>
-                            </div>
-                        </article>
-                    <?php endforeach; ?>
-                </div>
-            </div>
-        </section>
-    <?php endif; ?>
-<?php else: ?>
+<?php elseif ($hasClasses): ?>
     <section class="panel">
         <div class="panel-body">
             <div class="empty-state">
-                <h3>请先选择或输入班级</h3>
+                <h3>请先选择专业和班级</h3>
             </div>
         </div>
     </section>
@@ -1024,6 +1198,51 @@ if (!is_array($disclaimerRules)) {
 </div>
 
 <script>
+(function () {
+    var groups = window.__CLASS_GROUPS__ || [];
+    var majorSelect = document.getElementById('majorSelect');
+    var classSelect = document.getElementById('classSelect');
+
+    if (!majorSelect || !classSelect) {
+        return;
+    }
+
+    var current = classSelect.getAttribute('data-current') || '';
+
+    function fillClasses() {
+        var group = null;
+        for (var i = 0; i < groups.length; i += 1) {
+            if (String(groups[i].id) === String(majorSelect.value)) {
+                group = groups[i];
+                break;
+            }
+        }
+
+        classSelect.innerHTML = '';
+
+        if (!group || !group.classes.length) {
+            var empty = new Option('该专业暂无班级', '');
+            empty.disabled = true;
+            empty.selected = true;
+            classSelect.add(empty);
+            return;
+        }
+
+        for (var j = 0; j < group.classes.length; j += 1) {
+            var option = new Option(group.classes[j].name, group.classes[j].name);
+            if (group.classes[j].name === current) {
+                option.selected = true;
+            }
+            classSelect.add(option);
+        }
+
+        current = '';
+    }
+
+    majorSelect.addEventListener('change', fillClasses);
+    fillClasses();
+})();
+
 document.getElementById('disclaimerAgree').addEventListener('click', function () {
     document.getElementById('disclaimerModal').hidden = true;
     document.body.classList.remove('modal-open');

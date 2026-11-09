@@ -54,6 +54,14 @@ try {
         $stmt->execute([$songId]);
         $completedAt = (string) $stmt->fetchColumn();
 
+        audit_log(
+            'complete',
+            'song',
+            '歌曲',
+            $songId,
+            "标记《{$song['title']}》播放完毕（班级 {$song['class_name']}）"
+        );
+
         json_response([
             'ok'           => true,
             'completed_at' => $completedAt,
@@ -68,6 +76,14 @@ try {
              WHERE `id` = ? AND `status` = ?'
         );
         $stmt->execute([$songId, STATUS_APPROVED]);
+
+        audit_log(
+            'uncomplete',
+            'song',
+            '歌曲',
+            $songId,
+            "取消《{$song['title']}》的播放完毕标记（班级 {$song['class_name']}）"
+        );
 
         json_response(['ok' => true]);
     }

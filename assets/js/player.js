@@ -70,6 +70,7 @@
     var reviewCloseBtn = document.getElementById('reviewCloseBtn');
     var reviewApproveBtn = document.getElementById('reviewApproveBtn');
     var reviewRejectBtn = document.getElementById('reviewRejectBtn');
+    var reviewSkipSongBtn = document.getElementById('reviewSkipSongBtn');
     var reviewPositionEl = document.getElementById('reviewPosition');
     var reviewTitleEl = document.getElementById('reviewTitle');
     var reviewMetaEl = document.getElementById('reviewMeta');
@@ -88,6 +89,12 @@
     var reviewLoginCountEl = document.getElementById('reviewLoginCount');
     var pendingCountBadge = document.getElementById('pendingCountBadge');
     var openReviewBtn = document.getElementById('openReviewBtn');
+    var specialStage = document.getElementById('specialStage');
+    var specialContinueBtn = document.getElementById('specialContinueBtn');
+
+    var specialPending = Number(window.SPECIAL_PENDING || 0);
+    var reviewOpenRequested = window.REVIEW_OPEN === true;
+    var specialStageDismissed = false;
 
     var reviewStarted = false;
     var reviewFinished = false;
@@ -823,6 +830,9 @@
     }
 
     function showReviewStage(stage) {
+        if (specialStage) {
+            specialStage.hidden = stage !== 'special';
+        }
         reviewLogin.hidden = stage !== 'login';
         reviewWorkspace.hidden = stage !== 'workspace';
         reviewSummary.hidden = stage !== 'summary';
@@ -843,8 +853,34 @@
         playStateEl.textContent = '播放已暂停，等待审核';
     }
 
-    function openReviewModal() {
+    function proceedToSongReview() {
+        if (reviewFinished) {
+            showReviewStage('summary');
+            return;
+        }
+        if (reviewStarted) {
+            showReviewStage('workspace');
+            loadReviewSong();
+            return;
+        }
         if (pendingList.length === 0) {
+            closeReviewModal();
+            return;
+        }
+        showReviewStage('login');
+        window.setTimeout(function () {
+            reviewerNameInput.focus();
+        }, 50);
+    }
+
+    function openReviewModal() {
+        if (!reviewModal) {
+            return;
+        }
+
+        // 特殊播音审核排在第一位：有特殊播音待处理（或从特殊播音操作返回）时先展示该阶段。
+        var showSpecialFirst = !specialStageDismissed && (specialPending > 0 || reviewOpenRequested);
+        if (!showSpecialFirst && pendingList.length === 0) {
             return;
         }
 
@@ -853,17 +889,12 @@
         document.body.classList.add('modal-open');
         updatePendingDisplays();
 
-        if (reviewFinished) {
-            showReviewStage('summary');
-        } else if (reviewStarted) {
-            showReviewStage('workspace');
-            loadReviewSong();
-        } else {
-            showReviewStage('login');
-            window.setTimeout(function () {
-                reviewerNameInput.focus();
-            }, 50);
+        if (showSpecialFirst) {
+            showReviewStage('special');
+            return;
         }
+
+        proceedToSongReview();
     }
 
     function closeReviewModal() {
@@ -915,6 +946,9 @@
     function setReviewButtonsDisabled(disabled) {
         reviewApproveBtn.disabled = disabled;
         reviewRejectBtn.disabled = disabled;
+        if (reviewSkipSongBtn) {
+            reviewSkipSongBtn.disabled = disabled;
+        }
         reviewCloseBtn.disabled = disabled;
     }
 
@@ -1050,6 +1084,16 @@
         });
     }
 
+    function skipReviewSong() {
+        if (reviewBusy || reviewIndex >= pendingList.length) {
+            return;
+        }
+
+        reviewError.hidden = true;
+        reviewIndex += 1;
+        loadReviewSong();
+    }
+
     function buildRejectedText(rejected) {
         var lines = [];
         var now = new Date();
@@ -1091,9 +1135,10 @@
         var rejected = reviewResults.filter(function (item) {
             return item.decision === 'reject';
         });
+        var skipped = Math.max(0, pendingList.length - reviewResults.length);
 
-        reviewSummaryText.textContent = '本次共审核 ' + reviewResults.length + ' 首，通过 ' +
-            approved.length + ' 首，拒绝 ' + rejected.length + ' 首。';
+        reviewSummaryText.textContent = '本次共处理 ' + pendingList.length + ' 首，通过 ' +
+            approved.length + ' 首，拒绝 ' + rejected.length + ' 首，跳过 ' + skipped + ' 首（跳过的曲目仍待审核）。';
         rejectedList.value = buildRejectedText(rejected);
         copyRejectedBtn.textContent = '复制名单';
     }
@@ -1112,6 +1157,9 @@
     reviewRejectBtn.addEventListener('click', function () {
         submitReview('reject');
     });
+    if (reviewSkipSongBtn) {
+        reviewSkipSongBtn.addEventListener('click', skipReviewSong);
+    }
     reviewSkipBtn.addEventListener('click', function () {
         closeReviewModal();
         if (playQueue.length > 0 && !started) {
@@ -1121,6 +1169,13 @@
     });
     reviewCloseBtn.addEventListener('click', closeReviewModal);
     openReviewBtn.addEventListener('click', openReviewModal);
+
+    if (specialContinueBtn) {
+        specialContinueBtn.addEventListener('click', function () {
+            specialStageDismissed = true;
+            proceedToSongReview();
+        });
+    }
 
     copyRejectedBtn.addEventListener('click', function () {
         var text = rejectedList.value;
@@ -1166,7 +1221,7 @@
         playStateEl.textContent = '暂无可播放曲目';
     }
 
-    if (pendingList.length > 0) {
+    if (reviewOpenRequested || pendingList.length > 0) {
         openReviewModal();
     }
 })();

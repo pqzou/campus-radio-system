@@ -94,6 +94,18 @@ try {
         json_response(['ok' => false, 'message' => '该曲目已被其他审核人处理，请刷新页面。'], 409);
     }
 
+    audit_log(
+        $decision === 'approve' ? 'approve' : 'reject',
+        'song',
+        '歌曲',
+        $songId,
+        ($decision === 'approve' ? '审核通过' : '拒绝')
+            . "曲目《{$song['title']}》（班级 {$song['class_name']}）"
+            . ($decision === 'reject' && $rejectReason !== '' ? "：{$rejectReason}" : ''),
+        $reviewerName . '（' . $reviewerNo . '）',
+        'reviewer'
+    );
+
     json_response([
         'ok'           => true,
         'id'           => $songId,

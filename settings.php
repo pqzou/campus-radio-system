@@ -45,6 +45,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         admin_set_credentials($account, $password);
         session_regenerate_id(true);
         $_SESSION['admin_authenticated'] = true;
+        $_SESSION['admin_display'] = $account;
+        audit_log('setup', 'auth', '管理员账号', '', "首次设置管理员账号：{$account}", $account, 'admin');
         flash('success', '管理员账号已设置，已自动登录。');
         redirect('settings.php');
     }
@@ -58,18 +60,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (admin_login($account, $password)) {
             session_regenerate_id(true);
             $_SESSION['admin_authenticated'] = true;
+            $_SESSION['admin_display'] = $account;
+            audit_log('login', 'auth', '管理员账号', '', '登录成功', $account, 'admin');
             flash('success', '登录成功。');
             redirect('settings.php');
         }
 
         usleep(300000);
+        audit_log('login_failed', 'auth', '管理员账号', '', '账户或密码错误', $account, 'visitor');
         flash('error', '账户或密码错误。');
         redirect('settings.php');
     }
 
     if ($action === 'logout') {
         verify_csrf();
+        audit_log('logout', 'auth', '管理员账号', '', '退出登录');
         unset($_SESSION['admin_authenticated']);
+        unset($_SESSION['admin_display']);
         session_regenerate_id(true);
         flash('success', '已退出登录。');
         redirect('settings.php');
@@ -170,6 +177,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             update_setting('admin_password_hash', (string) password_hash($password, PASSWORD_DEFAULT));
         }
 
+        $changedParts = [];
+        if ($account !== '') {
+            $changedParts[] = '用户名';
+            $_SESSION['admin_display'] = $account;
+        }
+        if ($password !== '') {
+            $changedParts[] = '密码';
+        }
+
+        audit_log('update', 'auth', '管理员账号', '', '更新了' . implode('和', $changedParts));
+
         session_regenerate_id(true);
         flash('success', '管理员账号密码已更新。');
         redirect('settings.php');
@@ -191,6 +209,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$previousOpen && $open === '1') {
                 update_setting('upload_opened_at', date('Y-m-d H:i:s'));
             }
+
+            audit_log(
+                'update',
+                'settings',
+                '点播设置',
+                '',
+                '点播通道：' . ($open === '1' ? '开启' : '关闭') . "；单班上限：{$max} 首"
+            );
 
             flash('success', '设置已保存，新的规则已立即生效。');
         }
@@ -232,6 +258,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($added > 0) {
+            audit_log('add', 'uploader', '已验证博主', '', "新增 {$added} 个已验证博主 UID");
             flash('success', "已添加 {$added} 个已验证博主 UID。");
         }
         if ($skipped > 0) {
@@ -246,10 +273,303 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'delete_uid') {
         $id = (int) ($_POST['id'] ?? 0);
+
+        $stmt = $db->prepare('SELECT `uid` FROM `verified_uploaders` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$id]);
+        $uid = $stmt->fetchColumn();
+
         $stmt = $db->prepare('DELETE FROM `verified_uploaders` WHERE `id` = ?');
         $stmt->execute([$id]);
+
+        audit_log('delete', 'uploader', '已验证博主', $id, '删除 UID：' . ($uid !== false ? (string) $uid : '未知'));
+
         flash('success', '已验证博主 UID 已删除。');
         redirect('settings.php');
+    }
+
+    if ($action === 'add_major') {
+        $name = trim((string) ($_POST['name'] ?? ''));
+
+        if ($name === '') {
+            flash('error', '请填写专业名称。');
+        } elseif (text_length($name) > 50) {
+            flash('error', '专业名称不能超过 50 个字符。');
+        } else {
+            $stmt = $db->prepare('SELECT `id` FROM `majors` WHERE `name` = ? LIMIT 1');
+            $stmt->execute([$name]);
+
+            if ($stmt->fetchColumn() !== false) {
+                flash('error', '该专业已存在。');
+            } else {
+                $order = (int) $db->query('SELECT COALESCE(MAX(`sort_order`), 0) FROM `majors`')->fetchColumn() + 1;
+                $stmt  = $db->prepare('INSERT INTO `majors` (`name`, `sort_order`) VALUES (?, ?)');
+                $stmt->execute([$name, $order]);
+                audit_log('add', 'class', '专业', $db->lastInsertId(), "新增专业「{$name}」");
+                flash('success', "专业「{$name}」已添加。");
+            }
+        }
+
+        redirect('settings.php#class-manage');
+    }
+
+    if ($action === 'rename_major') {
+        $id   = (int) ($_POST['id'] ?? 0);
+        $name = trim((string) ($_POST['name'] ?? ''));
+
+        if ($name === '') {
+            flash('error', '请填写专业名称。');
+        } elseif (text_length($name) > 50) {
+            flash('error', '专业名称不能超过 50 个字符。');
+        } else {
+            $stmt = $db->prepare('SELECT `id` FROM `majors` WHERE `id` = ? LIMIT 1');
+            $stmt->execute([$id]);
+
+            if ($stmt->fetchColumn() === false) {
+                flash('error', '未找到该专业。');
+            } else {
+                $stmt = $db->prepare('SELECT `id` FROM `majors` WHERE `name` = ? AND `id` <> ? LIMIT 1');
+                $stmt->execute([$name, $id]);
+
+                if ($stmt->fetchColumn() !== false) {
+                    flash('error', '该专业名称已存在。');
+                } else {
+                    $stmt = $db->prepare('UPDATE `majors` SET `name` = ? WHERE `id` = ?');
+                    $stmt->execute([$name, $id]);
+                    audit_log('update', 'class', '专业', $id, "专业名称改为「{$name}」");
+                    flash('success', '专业名称已更新。');
+                }
+            }
+        }
+
+        redirect('settings.php#class-manage');
+    }
+
+    if ($action === 'delete_major') {
+        $id = (int) ($_POST['id'] ?? 0);
+
+        $stmt = $db->prepare('SELECT COUNT(*) FROM `classes` WHERE `major_id` = ?');
+        $stmt->execute([$id]);
+
+        if ((int) $stmt->fetchColumn() > 0) {
+            flash('error', '该专业下还有班级，请先删除或转移班级后再删除专业。');
+        } else {
+            $stmt = $db->prepare('DELETE FROM `majors` WHERE `id` = ?');
+            $stmt->execute([$id]);
+            audit_log('delete', 'class', '专业', $id, '删除专业（ID ' . $id . '）');
+            flash('success', '专业已删除。');
+        }
+
+        redirect('settings.php#class-manage');
+    }
+
+    if ($action === 'add_class') {
+        $majorId = (int) ($_POST['major_id'] ?? 0);
+        $name    = trim((string) ($_POST['name'] ?? ''));
+
+        $stmt = $db->prepare('SELECT `id` FROM `majors` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$majorId]);
+        $majorExists = $stmt->fetchColumn() !== false;
+
+        if (!$majorExists) {
+            flash('error', '请选择有效的专业。');
+        } elseif ($name === '') {
+            flash('error', '请填写班级名称。');
+        } elseif (text_length($name) > 50) {
+            flash('error', '班级名称不能超过 50 个字符。');
+        } else {
+            $stmt = $db->prepare('SELECT `id` FROM `classes` WHERE `name` = ? LIMIT 1');
+            $stmt->execute([$name]);
+
+            if ($stmt->fetchColumn() !== false) {
+                flash('error', '该班级名称已存在。');
+            } else {
+                $stmt = $db->prepare(
+                    'SELECT COALESCE(MAX(`sort_order`), 0) FROM `classes` WHERE `major_id` = ?'
+                );
+                $stmt->execute([$majorId]);
+                $order = (int) $stmt->fetchColumn() + 1;
+
+                $stmt = $db->prepare(
+                    'INSERT INTO `classes` (`major_id`, `name`, `sort_order`) VALUES (?, ?, ?)'
+                );
+                $stmt->execute([$majorId, $name, $order]);
+                audit_log('add', 'class', '班级', $db->lastInsertId(), "新增班级「{$name}」");
+                flash('success', "班级「{$name}」已添加。");
+            }
+        }
+
+        redirect('settings.php#class-manage');
+    }
+
+    if ($action === 'update_class') {
+        $id      = (int) ($_POST['id'] ?? 0);
+        $majorId = (int) ($_POST['major_id'] ?? 0);
+        $name    = trim((string) ($_POST['name'] ?? ''));
+
+        $stmt = $db->prepare('SELECT `id`, `name` FROM `classes` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$id]);
+        $class = $stmt->fetch();
+
+        $stmt = $db->prepare('SELECT `id` FROM `majors` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$majorId]);
+        $majorExists = $stmt->fetchColumn() !== false;
+
+        if ($class === false) {
+            flash('error', '未找到该班级。');
+        } elseif (!$majorExists) {
+            flash('error', '请选择有效的专业。');
+        } elseif ($name === '') {
+            flash('error', '请填写班级名称。');
+        } elseif (text_length($name) > 50) {
+            flash('error', '班级名称不能超过 50 个字符。');
+        } else {
+            $stmt = $db->prepare('SELECT `id` FROM `classes` WHERE `name` = ? AND `id` <> ? LIMIT 1');
+            $stmt->execute([$name, $id]);
+
+            if ($stmt->fetchColumn() !== false) {
+                flash('error', '该班级名称已存在。');
+            } else {
+                $oldName = (string) $class['name'];
+
+                $db->beginTransaction();
+                try {
+                    if ($name !== $oldName) {
+                        $stmt = $db->prepare('UPDATE `songs` SET `class_name` = ? WHERE `class_name` = ?');
+                        $stmt->execute([$name, $oldName]);
+                    }
+
+                    $stmt = $db->prepare(
+                        'UPDATE `classes` SET `name` = ?, `major_id` = ? WHERE `id` = ?'
+                    );
+                    $stmt->execute([$name, $majorId, $id]);
+                    $db->commit();
+                } catch (Throwable $e) {
+                    if ($db->inTransaction()) {
+                        $db->rollBack();
+                    }
+                    throw $e;
+                }
+
+                audit_log('update', 'class', '班级', $id, "班级「{$oldName}」更新为「{$name}」");
+                flash('success', '班级信息已更新。');
+            }
+        }
+
+        redirect('settings.php#class-manage');
+    }
+
+    if ($action === 'delete_class') {
+        $id = (int) ($_POST['id'] ?? 0);
+
+        $stmt = $db->prepare('SELECT `name` FROM `classes` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$id]);
+        $name = $stmt->fetchColumn();
+
+        if ($name === false) {
+            flash('error', '未找到该班级。');
+        } else {
+            $stmt = $db->prepare('SELECT COUNT(*) FROM `songs` WHERE `class_name` = ?');
+            $stmt->execute([$name]);
+
+            if ((int) $stmt->fetchColumn() > 0) {
+                flash('error', '该班级已有上传记录，不能删除；可修改班级名称或调整所属专业。');
+            } else {
+                $stmt = $db->prepare('DELETE FROM `classes` WHERE `id` = ?');
+                $stmt->execute([$id]);
+                audit_log('delete', 'class', '班级', $id, "删除班级「{$name}」");
+                flash('success', '班级已删除。');
+            }
+        }
+
+        redirect('settings.php#class-manage');
+    }
+
+    if ($action === 'add_special_preset') {
+        $name    = trim((string) ($_POST['name'] ?? ''));
+        $content = trim((string) ($_POST['content'] ?? ''));
+
+        if ($name === '') {
+            flash('error', '请填写预制播音名称。');
+        } elseif (text_length($name) > 80) {
+            flash('error', '预制播音名称不能超过 80 个字符。');
+        } elseif (text_length($content) > 5000) {
+            flash('error', '预置播稿内容不能超过 5000 个字符。');
+        } else {
+            $stmt = $db->prepare('SELECT `id` FROM `special_presets` WHERE `name` = ? LIMIT 1');
+            $stmt->execute([$name]);
+
+            if ($stmt->fetchColumn() !== false) {
+                flash('error', '该预制播音已存在。');
+            } else {
+                $order = (int) $db->query('SELECT COALESCE(MAX(`sort_order`), 0) FROM `special_presets`')->fetchColumn() + 1;
+                $stmt  = $db->prepare(
+                    'INSERT INTO `special_presets` (`name`, `content`, `sort_order`) VALUES (?, ?, ?)'
+                );
+                $stmt->execute([$name, $content, $order]);
+                audit_log('add', 'special', '预制播音', $db->lastInsertId(), "新增预制播音「{$name}」");
+                flash('success', "预制播音「{$name}」已添加。");
+            }
+        }
+
+        redirect('settings.php#special-presets');
+    }
+
+    if ($action === 'update_special_preset') {
+        $id      = (int) ($_POST['id'] ?? 0);
+        $name    = trim((string) ($_POST['name'] ?? ''));
+        $content = trim((string) ($_POST['content'] ?? ''));
+
+        $stmt = $db->prepare('SELECT `id` FROM `special_presets` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$id]);
+
+        if ($stmt->fetchColumn() === false) {
+            flash('error', '未找到该预制播音。');
+        } elseif ($name === '') {
+            flash('error', '请填写预制播音名称。');
+        } elseif (text_length($name) > 80) {
+            flash('error', '预制播音名称不能超过 80 个字符。');
+        } elseif (text_length($content) > 5000) {
+            flash('error', '预置播稿内容不能超过 5000 个字符。');
+        } else {
+            $stmt = $db->prepare('SELECT `id` FROM `special_presets` WHERE `name` = ? AND `id` <> ? LIMIT 1');
+            $stmt->execute([$name, $id]);
+
+            if ($stmt->fetchColumn() !== false) {
+                flash('error', '该预制播音名称已存在。');
+            } else {
+                $stmt = $db->prepare(
+                    'UPDATE `special_presets` SET `name` = ?, `content` = ?, `updated_at` = NOW() WHERE `id` = ?'
+                );
+                $stmt->execute([$name, $content, $id]);
+                audit_log('update', 'special', '预制播音', $id, "更新预制播音「{$name}」");
+                flash('success', '预制播音已更新。');
+            }
+        }
+
+        redirect('settings.php#special-presets');
+    }
+
+    if ($action === 'delete_special_preset') {
+        $id = (int) ($_POST['id'] ?? 0);
+
+        $stmt = $db->prepare('SELECT `name` FROM `special_presets` WHERE `id` = ? LIMIT 1');
+        $stmt->execute([$id]);
+        $presetName = $stmt->fetchColumn();
+
+        $stmt = $db->prepare('DELETE FROM `special_presets` WHERE `id` = ?');
+        $stmt->execute([$id]);
+
+        audit_log(
+            'delete',
+            'special',
+            '预制播音',
+            $id,
+            '删除预制播音「' . ($presetName !== false ? (string) $presetName : '未知') . '」'
+        );
+
+        flash('success', '预制播音已删除。');
+
+        redirect('settings.php#special-presets');
     }
 
     flash('error', '未知操作。');
@@ -277,15 +597,16 @@ foreach ($statusRows as $row) {
 
 $totalSongs     = array_sum($counts);
 $pendingTotal   = $counts[STATUS_PENDING] + $counts[STATUS_RE_REVIEW];
-$classCount     = (int) $db->query('SELECT COUNT(DISTINCT `class_name`) FROM `songs`')->fetchColumn();
+$majors         = get_majors_with_classes($db);
+$classCount     = (int) $db->query('SELECT COUNT(*) FROM `classes`')->fetchColumn();
+$specialPresets = $db->query(
+    'SELECT * FROM `special_presets` ORDER BY `sort_order` ASC, `id` ASC'
+)->fetchAll();
 $completedCount = (int) $db->query(
     "SELECT COUNT(*) FROM `songs` WHERE `status` = 'approved' AND `completed_at` IS NOT NULL"
 )->fetchColumn();
 
 $verifiedUploaders = get_verified_uploaders($db);
-$history = $db->query(
-    'SELECT * FROM `songs` ORDER BY `created_at` DESC, `id` DESC'
-)->fetchAll();
 
 $pageTitle = '系统设置';
 $activeNav = 'settings';
@@ -295,7 +616,7 @@ require __DIR__ . '/includes/header.php';
 <div class="page-head">
     <div>
         <p class="eyebrow">后台管理</p>
-        <h1 class="page-title">系统设置与上传记录</h1>
+        <h1 class="page-title">系统设置</h1>
     </div>
     <div class="page-head-actions">
         <form class="inline-form" method="post" action="settings.php">
@@ -378,6 +699,194 @@ require __DIR__ . '/includes/header.php';
         </div>
     </aside>
 </div>
+
+<section class="panel class-manage-panel" id="class-manage">
+    <div class="panel-head">
+        <h2>专业与班级管理</h2>
+        <p>学生上传时需先选择专业，再选择班级；这里维护可选的专业和班级列表。</p>
+    </div>
+    <div class="panel-body">
+        <form class="manage-add-form" method="post" action="settings.php">
+            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+            <input type="hidden" name="action" value="add_major">
+
+            <div class="field">
+                <label for="newMajorName">新增专业</label>
+                <div class="manage-inline">
+                    <input class="input input-compact" id="newMajorName" type="text" name="name"
+                           maxlength="50" placeholder="例如：护理专业" required>
+                    <button class="btn btn-primary" type="submit">添加专业</button>
+                </div>
+            </div>
+        </form>
+
+        <?php if (!$majors): ?>
+            <div class="notice notice-warn">
+                <strong>尚未设置专业</strong>
+                <span>请先添加专业，再在各专业下添加班级；未设置前学生无法选择班级。</span>
+            </div>
+        <?php else: ?>
+            <?php foreach ($majors as $major): ?>
+                <div class="major-card">
+                    <div class="major-card-head">
+                        <form class="major-rename-form" method="post" action="settings.php">
+                            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                            <input type="hidden" name="action" value="rename_major">
+                            <input type="hidden" name="id" value="<?= (int) $major['id'] ?>">
+                            <input class="input input-compact" type="text" name="name"
+                                   value="<?= h($major['name']) ?>" maxlength="50"
+                                   aria-label="专业名称" required>
+                            <button class="btn btn-secondary btn-sm" type="submit">保存名称</button>
+                        </form>
+                        <form class="inline-form" method="post" action="settings.php"
+                              onsubmit="return confirm('确定删除这个专业吗？');">
+                            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                            <input type="hidden" name="action" value="delete_major">
+                            <input type="hidden" name="id" value="<?= (int) $major['id'] ?>">
+                            <button class="btn btn-danger btn-sm" type="submit">删除专业</button>
+                        </form>
+                    </div>
+
+                    <?php if ($major['classes']): ?>
+                        <div class="table-scroll">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>班级名称 / 所属专业</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($major['classes'] as $item): ?>
+                                        <tr>
+                                            <td>
+                                                <form class="class-row-form" method="post" action="settings.php">
+                                                    <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                                    <input type="hidden" name="action" value="update_class">
+                                                    <input type="hidden" name="id" value="<?= (int) $item['id'] ?>">
+                                                    <input class="input input-compact" type="text" name="name"
+                                                           value="<?= h($item['name']) ?>" maxlength="50"
+                                                           aria-label="班级名称" required>
+                                                    <select class="input input-compact" name="major_id"
+                                                            aria-label="所属专业">
+                                                        <?php foreach ($majors as $optionMajor): ?>
+                                                            <option value="<?= (int) $optionMajor['id'] ?>"
+                                                                <?= (int) $optionMajor['id'] === (int) $major['id'] ? 'selected' : '' ?>>
+                                                                <?= h($optionMajor['name']) ?>
+                                                            </option>
+                                                        <?php endforeach; ?>
+                                                    </select>
+                                                    <button class="btn btn-secondary btn-sm" type="submit">保存</button>
+                                                </form>
+                                            </td>
+                                            <td class="nowrap">
+                                                <form class="inline-form" method="post" action="settings.php"
+                                                      onsubmit="return confirm('确定删除这个班级吗？');">
+                                                    <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                                    <input type="hidden" name="action" value="delete_class">
+                                                    <input type="hidden" name="id" value="<?= (int) $item['id'] ?>">
+                                                    <button class="btn btn-danger btn-sm" type="submit">删除</button>
+                                                </form>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    <?php else: ?>
+                        <p class="field-hint">该专业下还没有班级。</p>
+                    <?php endif; ?>
+
+                    <form class="add-class-form" method="post" action="settings.php">
+                        <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                        <input type="hidden" name="action" value="add_class">
+                        <input type="hidden" name="major_id" value="<?= (int) $major['id'] ?>">
+                        <input class="input input-compact" type="text" name="name"
+                               maxlength="50" placeholder="新增班级名称，例如：护理 1 班" required>
+                        <button class="btn btn-secondary btn-sm" type="submit">添加班级</button>
+                    </form>
+                </div>
+            <?php endforeach; ?>
+        <?php endif; ?>
+    </div>
+</section>
+
+<section class="panel special-preset-panel" id="special-presets">
+    <div class="panel-head">
+        <h2>特殊播音预设</h2>
+        <p>学生在上传页选择预制播音后，会自动带出名称和播稿内容，例如“生日快乐歌”“生日祝福”。</p>
+    </div>
+    <div class="panel-body">
+        <form class="manage-add-form" method="post" action="settings.php">
+            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+            <input type="hidden" name="action" value="add_special_preset">
+
+            <div class="field">
+                <label for="newPresetName">新增预制播音</label>
+                <div class="manage-inline">
+                    <input class="input input-compact" id="newPresetName" type="text" name="name"
+                           maxlength="80" placeholder="例如：生日快乐" required>
+                    <button class="btn btn-primary" type="submit">添加预制播音</button>
+                </div>
+            </div>
+
+            <div class="field">
+                <label for="newPresetContent">预置播稿内容（选填）</label>
+                <textarea class="input textarea textarea-sm preset-content" id="newPresetContent"
+                          name="content" maxlength="5000"
+                          placeholder="例如：今天是 XX 同学的生日，广播站为你送上生日快乐歌，祝你生日快乐！"></textarea>
+            </div>
+        </form>
+
+        <?php if (!$specialPresets): ?>
+            <div class="notice notice-warn">
+                <strong>还没有预制播音</strong>
+                <span>添加后，学生在上传页提交特殊播音时可以直接下拉选择。</span>
+            </div>
+        <?php else: ?>
+            <div class="table-scroll">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>预制播音</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($specialPresets as $preset): ?>
+                            <tr>
+                                <td>
+                                    <form class="preset-row-form" method="post" action="settings.php">
+                                        <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                        <input type="hidden" name="action" value="update_special_preset">
+                                        <input type="hidden" name="id" value="<?= (int) $preset['id'] ?>">
+                                        <input class="input input-compact" type="text" name="name"
+                                               value="<?= h($preset['name']) ?>" maxlength="80"
+                                               aria-label="预制播音名称" required>
+                                        <textarea class="input textarea textarea-sm preset-content"
+                                                  name="content" maxlength="5000"
+                                                  placeholder="预置播稿内容（选填）"
+                                                  aria-label="预置播稿内容"><?= h($preset['content']) ?></textarea>
+                                        <button class="btn btn-secondary btn-sm" type="submit">保存</button>
+                                    </form>
+                                </td>
+                                <td class="nowrap">
+                                    <form class="inline-form" method="post" action="settings.php"
+                                          onsubmit="return confirm('确定删除这个预制播音吗？');">
+                                        <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+                                        <input type="hidden" name="action" value="delete_special_preset">
+                                        <input type="hidden" name="id" value="<?= (int) $preset['id'] ?>">
+                                        <button class="btn btn-danger btn-sm" type="submit">删除</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+    </div>
+</section>
 
 <section class="panel admin-account-panel">
     <div class="panel-head">
@@ -493,92 +1002,12 @@ require __DIR__ . '/includes/header.php';
         <strong><?= h((string) $counts[STATUS_APPROVED]) ?></strong>
     </div>
     <div class="summary-item">
-        <span>未通过</span>
+        <span>拒绝</span>
         <strong><?= h((string) $counts[STATUS_REJECTED]) ?></strong>
     </div>
     <div class="summary-item">
         <span>已标记完成</span>
         <strong><?= h((string) $completedCount) ?></strong>
-    </div>
-</section>
-
-<section class="panel history-panel">
-    <div class="panel-head">
-        <h2>上传审核日志</h2>
-        <p>共 <?= h((string) $totalSongs) ?> 条记录。</p>
-    </div>
-
-    <div class="panel-body">
-        <?php if (!$history): ?>
-            <div class="empty-state">
-                <h3>暂无上传记录</h3>
-                <p>班级提交节目后，记录会显示在这里。</p>
-            </div>
-        <?php else: ?>
-            <div class="table-scroll">
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>班级</th>
-                            <th>歌曲</th>
-                            <th>上传人</th>
-                            <th>广播备注</th>
-                            <th>状态</th>
-                            <th>申请上传时间</th>
-                            <th>审核信息</th>
-                            <th>完成时间</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($history as $song): ?>
-                            <tr>
-                                <td class="nowrap"><?= h($song['class_name']) ?></td>
-                                <td>
-                                    <strong>《<?= h($song['title']) ?>》</strong>
-                                    <span class="sub-text">作者：<?= h($song['artist'] !== '' ? $song['artist'] : '未填写') ?></span>
-                                    <?php if (!empty($song['bvid'])): ?>
-                                        <a class="bvid-link" href="https://www.bilibili.com/video/<?= h($song['bvid']) ?>"
-                                           target="_blank" rel="noopener"><?= h($song['bvid']) ?></a>
-                                    <?php else: ?>
-                                        <span class="sub-text">待审核补充播放链接</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="nowrap">
-                                    <?= h($song['uploader_name'] !== '' ? $song['uploader_name'] : '未填写') ?>
-                                    <span class="sub-text"><?= h($song['uploader_no'] !== '' ? $song['uploader_no'] : '') ?></span>
-                                </td>
-                                <td class="remark-cell" title="<?= h($song['remark']) ?>">
-                                    <?= h($song['remark'] !== '' ? $song['remark'] : '—') ?>
-                                </td>
-                                <td class="nowrap">
-                                    <span class="badge <?= h(status_class((string) $song['status'])) ?>">
-                                        <?= h(status_label((string) $song['status'])) ?>
-                                    </span>
-                                    <?php if ($song['completed_at'] !== null): ?>
-                                        <span class="tag-done">已完成</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="nowrap"><?= h(substr((string) $song['created_at'], 0, 16)) ?></td>
-                                <td class="nowrap">
-                                    <?php if ($song['reviewer_name']): ?>
-                                        <?= h($song['reviewer_name']) ?>（<?= h($song['reviewer_no']) ?>）
-                                        <span class="sub-text"><?= h(substr((string) $song['reviewed_at'], 0, 16)) ?></span>
-                                    <?php else: ?>
-                                        —
-                                    <?php endif; ?>
-                                    <?php if ($song['status'] === STATUS_REJECTED && !empty($song['reject_reason'])): ?>
-                                        <span class="reject-reason-text">拒绝原因：<?= h($song['reject_reason']) ?></span>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="nowrap">
-                                    <?= $song['completed_at'] !== null ? h(substr((string) $song['completed_at'], 0, 16)) : '—' ?>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-        <?php endif; ?>
     </div>
 </section>
 

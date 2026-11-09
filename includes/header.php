@@ -4,24 +4,31 @@ $activeNav = $activeNav ?? '';
 $bodyClass = $bodyClass ?? '';
 $flashes   = pull_flashes();
 $navItems  = [
+    'home'     => ['index.php', '首页'],
     'upload'   => ['upload.php', '班级上传'],
-    'player'   => ['player.php', '大屏播放与审核', true],
-    'settings' => ['settings.php', '系统设置'],
+    'player'   => ['player.php', '大屏播放与审核'],
 ];
+if (admin_is_logged_in()) {
+    $navItems['activities'] = ['activities.php', '活动管理'];
+    $navItems['articles'] = ['articles.php', '文章管理'];
+    $navItems['logs'] = ['audit-logs.php', '审计日志'];
+}
+$navItems['settings'] = ['settings.php', '系统设置'];
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="color-scheme" content="light">
     <title><?= h($pageTitle) ?> - <?= h(site_text('header_title')) ?></title>
-    <link rel="stylesheet" href="assets/css/style.css?v=12">
+    <link rel="stylesheet" href="assets/css/style.css?v=34">
+    <script src="assets/js/fingerprint.js"></script>
 </head>
 <body class="<?= h($bodyClass) ?>">
 <header class="site-header">
     <div class="container nav-wrap">
-        <a class="brand" href="upload.php">
+        <a class="brand" href="index.php">
             <img class="school-logo" src="assets/img/school-logo.png" alt="学校校徽"
                  onerror="this.onerror=null;this.src='assets/img/school-logo-placeholder.svg';">
             <span class="brand-text">
@@ -32,10 +39,8 @@ $navItems  = [
         <nav class="main-nav" aria-label="主导航">
             <?php foreach ($navItems as $key => $item): ?>
                 <a href="<?= h($item[0]) ?>"
-                   class="<?= $activeNav === $key ? 'is-active' : '' ?>"
-                   <?= !empty($item[2]) ? 'target="_blank" rel="noopener"' : '' ?>>
+                   class="<?= $activeNav === $key ? 'is-active' : '' ?>">
                     <?= h($item[1]) ?>
-                    <?php if (!empty($item[2])): ?><span class="nav-external" aria-hidden="true">↗</span><?php endif; ?>
                 </a>
             <?php endforeach; ?>
         </nav>
